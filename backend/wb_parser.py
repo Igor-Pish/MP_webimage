@@ -17,38 +17,29 @@ def fetch_wb_price(nm_id: int) -> dict:
       - price_after_seller_discount ← price.product / 100 (итоговая)
     Если price в первом размере пустой — ищем в следующем.
     """
-    url = (f"https://card.wb.ru/cards/v2/detail"
-           f"?appType=1&curr=rub&dest=-1257786&lang=ru&nm={nm_id}")
+    url = (f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&lang=ru&nm={nm_id}")
 
     r = SESSION.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
 
-    products = (data.get("data") or {}).get("products") or []
-    if not products:
+    try:
+        product = data["data"]["products"][0]
+        price_before_discount = product["sizes"][0]["price"]["basic"] / 100
+        price_after_seller_discount = product["sizes"][0]["price"]["product"] / 100
+
+        # НОВОЕ: селлер
+        seller_id = product.get("supplierId")
+        seller_name = product.get("supplier")
+    except (KeyError, IndexError):
         raise ValueError(f"Товар с nm_id={nm_id} не найден")
-
-    p = products[0]
-
-    basic_u = 0
-    product_u = 0
-    for s in p.get("sizes", []):
-        pr = (s or {}).get("price") or {}
-        # в новом формате поля называются basic/product/total/...
-        if not basic_u:
-            basic_u = int(pr.get("basic") or 0)
-        if not product_u:
-            product_u = int(pr.get("product") or 0)
-        if basic_u and product_u:
-            break
-
-    price_before_discount = basic_u / 100.0 if basic_u else 0.0
-    price_after_seller_discount = product_u / 100.0 if product_u else 0.0
 
     return {
         "nm_id": nm_id,
-        "brand": p.get("brand", ""),
-        "title": p.get("name", ""),
-        "price_before_discount": price_before_discount,          # ← basic/100
-        "price_after_seller_discount": price_after_seller_discount,  # ← product/100
+        "brand": product.get("brand", ""),
+        "title": product.get("name", ""),
+        "price_before_discount": price_before_discount,
+        "price_after_seller_discount": price_after_seller_discount,
+        "seller_id": seller_id,
+        "seller_name": seller_name,
     }

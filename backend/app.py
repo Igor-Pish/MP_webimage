@@ -36,6 +36,8 @@ def add_product():
             title=data.get("title", "") or "",
             price_before=float(data.get("price_before_discount") or 0),
             price_after=float(data.get("price_after_seller_discount") or 0),
+            seller_id=data.get("seller_id"),
+            seller_name=data.get("seller_name") or None,
         )
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -51,6 +53,8 @@ def refresh_product(nm_id: int):
             title=data.get("title", "") or "",
             price_before=float(data.get("price_before_discount") or 0),
             price_after=float(data.get("price_after_seller_discount") or 0),
+            seller_id=data.get("seller_id"),
+            seller_name=data.get("seller_name") or None,
         )
         return jsonify({"ok": True, "item": data})
     except Exception as e:

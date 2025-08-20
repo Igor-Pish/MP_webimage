@@ -51,10 +51,12 @@ def _row_to_dict(row) -> Dict:
         "nm_id": row[0],
         "brand": row[1],
         "title": row[2],
-        "price_before_discount": float(row[3]) if row[3] is not None else 0.0,
-        "price_after_seller_discount": float(row[4]) if row[4] is not None else 0.0,
-        "rrc": float(row[5]) if row[5] is not None else None,
-        "updated_at": row[6].isoformat() if row[6] else None,
+        "seller_id": row[3],
+        "seller_name": row[4],
+        "price_before_discount": float(row[5]) if row[5] is not None else 0.0,
+        "price_after_seller_discount": float(row[6]) if row[6] is not None else 0.0,
+        "rrc": float(row[7]) if row[7] is not None else None,
+        "updated_at": row[8].isoformat() if row[8] else None,
     }
 
 
@@ -67,6 +69,8 @@ def list_products() -> List[Dict]:
             nm_id,
             brand,
             title,
+            seller_id,
+            seller_name,
             price_before_discount,
             price_after_seller_discount,
             rrc,
@@ -93,18 +97,19 @@ def upsert_product(
     title: str,
     price_before: float,
     price_after: float,
+    seller_id: int | None = None,
+    seller_name: str | None = None,
 ) -> None:
-    """
-    Вставляет/обновляет товар по nm_id.
-    ВНИМАНИЕ: rrc НЕ трогаем (чтобы не затирать вручную введённое значение).
-    """
     sql = f"""
         INSERT INTO {TABLE}
-            (nm_id, brand, title, price_before_discount, price_after_seller_discount, updated_at)
-        VALUES (%s, %s, %s, %s, %s, NOW())
+            (nm_id, brand, title, seller_id, seller_name,
+             price_before_discount, price_after_seller_discount, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
         ON DUPLICATE KEY UPDATE
             brand = VALUES(brand),
             title = VALUES(title),
+            seller_id = VALUES(seller_id),
+            seller_name = VALUES(seller_name),
             price_before_discount = VALUES(price_before_discount),
             price_after_seller_discount = VALUES(price_after_seller_discount),
             updated_at = NOW()
@@ -113,7 +118,7 @@ def upsert_product(
         conn = get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, (nm_id, brand, title, price_before, price_after))
+                cur.execute(sql, (nm_id, brand, title, seller_id, seller_name, price_before, price_after))
             conn.commit()
         finally:
             conn.close()
