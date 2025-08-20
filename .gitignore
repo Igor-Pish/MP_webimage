@@ -1,0 +1,26 @@
+# node / vite
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend
+
+# python
+backend/venv/
+backend/__pycache__/
+*.pyc
+*.pyo
+run_dev.py
+
+# env
+.env
+*.env
+.env.local
+.env.production
+
+# os junk
+.DS_Store
+Thumbs.db
+
+# Locals
+startup.txt
+old
