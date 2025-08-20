@@ -97,8 +97,8 @@ def upsert_product(
     title: str,
     price_before: float,
     price_after: float,
-    seller_id: int | None = None,
-    seller_name: str | None = None,
+    seller_id: Optional[int] = None,
+    seller_name: Optional[str] = None,
 ) -> None:
     sql = f"""
         INSERT INTO {TABLE}
