@@ -3,6 +3,7 @@ from flask_cors import CORS
 from wb_parser import fetch_wb_price
 from db import list_products as db_list, upsert_product, delete_product as db_delete
 from db import set_rrc
+from wb_ui_html import fetch_ui_prices_from_html
 
 application = Flask(__name__)
 CORS(application, resources={r"/api/*": {"origins": "*"}},
@@ -40,6 +41,31 @@ def add_product():
             seller_name=data.get("seller_name") or None,
         )
         return jsonify({"ok": True, "item": data})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@application.route("/api/products/<int:nm_id>/ui-price", methods=["GET", "POST"])
+def ui_price(nm_id: int):
+    """
+    Возвращает ТОЛЬКО UI-цены (ничего не пишет в БД).
+    Делаем удобный формат для фронта:
+      {
+        ok: true,
+        current_price_ui: ...,
+        price_before_discount_ui: ...,
+        wallet_price_ui: ...,
+        ui: { ... те же поля + url, nm_id, source ... }
+      }
+    """
+    try:
+        ui = fetch_ui_prices_from_html(nm_id)  # {nm_id, url, current_price_ui, price_before_discount_ui, wallet_price_ui, source}
+        return jsonify({
+            "ok": True,
+            "current_price_ui": ui.get("current_price_ui"),
+            "price_before_discount_ui": ui.get("price_before_discount_ui"),
+            "wallet_price_ui": ui.get("wallet_price_ui"),
+            "ui": ui
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
