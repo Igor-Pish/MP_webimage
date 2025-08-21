@@ -6,16 +6,17 @@ from db import set_rrc
 
 import os
 from math import floor
+from typing import Optional  # <-- для Python 3.9
 from dotenv import load_dotenv
 
 load_dotenv()  # загрузим .env заранее
 
 # Константы для расчёта фиолетовой цены (в рублях)
 UI_WALLET_PERCENT = float(os.getenv("UI_WALLET_PERCENT", "0"))        # например 0.02 = 2%
-UI_ROUND_THRESHOLD = float(os.getenv("UI_ROUND_THRESHOLD", "0"))      # порог для округления, руб (0 = не применять)
+UI_ROUND_THRESHOLD = float(os.getenv("UI_ROUND_THRESHOLD", "0"))      # порог для округления (0 = не применять)
 UI_ROUND_STEP = float(os.getenv("UI_ROUND_STEP", "1"))                # кратность округления, руб (минимум 1)
 
-def calc_ui_price_from_product(base_price: float | None) -> float | None:
+def calc_ui_price_from_product(base_price: Optional[float]) -> Optional[float]:
     """
     Фиолетовая цена (UI) от price_after_seller_discount:
       raw = base * (1 - p)
@@ -36,7 +37,7 @@ def calc_ui_price_from_product(base_price: float | None) -> float | None:
             ui = floor(raw / step) * step
         else:
             ui = raw
-        return float(f"{ui:.2f}")
+        return int(ui)
     except Exception:
         return None
 
@@ -51,11 +52,11 @@ def health():
 @application.get("/api/products")
 def list_products():
     try:
-        items = db_list()  # [{'nm_id', 'brand', 'title', 'price_before_discount', 'price_after_seller_discount', 'rrc', ...}, ...]
-        # NEW: добавим вычисленное поле ui_price на лету
+        items = db_list()
+        # Добавим вычисленное поле ui_price на лету
         enriched = []
         for it in items:
-            it = dict(it)  # скопируем, чтобы не портить исходник
+            it = dict(it)  # не портим исходник
             base = it.get("price_after_seller_discount")
             it["ui_price"] = calc_ui_price_from_product(base)
             enriched.append(it)
