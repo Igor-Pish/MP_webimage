@@ -3,7 +3,42 @@ from flask_cors import CORS
 from wb_parser import fetch_wb_price
 from db import list_products as db_list, upsert_product, delete_product as db_delete
 from db import set_rrc
-from wb_ui_html import fetch_ui_prices_from_html
+
+import os
+from math import floor
+from dotenv import load_dotenv
+
+load_dotenv()  # загрузим .env заранее
+
+# Константы для расчёта фиолетовой цены (в рублях)
+UI_WALLET_PERCENT = float(os.getenv("UI_WALLET_PERCENT", "0"))        # например 0.02 = 2%
+UI_ROUND_THRESHOLD = float(os.getenv("UI_ROUND_THRESHOLD", "0"))      # порог для округления, руб (0 = не применять)
+UI_ROUND_STEP = float(os.getenv("UI_ROUND_STEP", "1"))                # кратность округления, руб (минимум 1)
+
+def calc_ui_price_from_product(base_price: float | None) -> float | None:
+    """
+    Фиолетовая цена (UI) от price_after_seller_discount:
+      raw = base * (1 - p)
+      если base >= threshold: ui = floor(raw / step) * step
+      иначе ui = raw
+    Все величины — в рублях. Возвращает число с 2 знаками после запятой.
+    """
+    if base_price is None:
+        return None
+    try:
+        base = float(base_price)
+        p = UI_WALLET_PERCENT
+        thr = UI_ROUND_THRESHOLD
+        step = UI_ROUND_STEP if UI_ROUND_STEP > 0 else 1.0
+
+        raw = base * (1.0 - p) if p > 0 else base
+        if thr > 0 and base >= thr:
+            ui = floor(raw / step) * step
+        else:
+            ui = raw
+        return float(f"{ui:.2f}")
+    except Exception:
+        return None
 
 application = Flask(__name__)
 CORS(application, resources={r"/api/*": {"origins": "*"}},
@@ -16,8 +51,15 @@ def health():
 @application.get("/api/products")
 def list_products():
     try:
-        items = db_list()
-        return jsonify({"items": items})
+        items = db_list()  # [{'nm_id', 'brand', 'title', 'price_before_discount', 'price_after_seller_discount', 'rrc', ...}, ...]
+        # NEW: добавим вычисленное поле ui_price на лету
+        enriched = []
+        for it in items:
+            it = dict(it)  # скопируем, чтобы не портить исходник
+            base = it.get("price_after_seller_discount")
+            it["ui_price"] = calc_ui_price_from_product(base)
+            enriched.append(it)
+        return jsonify({"items": enriched})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -41,31 +83,6 @@ def add_product():
             seller_name=data.get("seller_name") or None,
         )
         return jsonify({"ok": True, "item": data})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@application.route("/api/products/<int:nm_id>/ui-price", methods=["GET", "POST"])
-def ui_price(nm_id: int):
-    """
-    Возвращает ТОЛЬКО UI-цены (ничего не пишет в БД).
-    Делаем удобный формат для фронта:
-      {
-        ok: true,
-        current_price_ui: ...,
-        price_before_discount_ui: ...,
-        wallet_price_ui: ...,
-        ui: { ... те же поля + url, nm_id, source ... }
-      }
-    """
-    try:
-        ui = fetch_ui_prices_from_html(nm_id)  # {nm_id, url, current_price_ui, price_before_discount_ui, wallet_price_ui, source}
-        return jsonify({
-            "ok": True,
-            "current_price_ui": ui.get("current_price_ui"),
-            "price_before_discount_ui": ui.get("price_before_discount_ui"),
-            "wallet_price_ui": ui.get("wallet_price_ui"),
-            "ui": ui
-        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -96,7 +113,6 @@ def delete_product(nm_id: int):
 
 @application.post("/api/products/<int:nm_id>/rrc")
 def post_rrc(nm_id: int):
-    # тот же код, что в patch_rrc — переиспользуем логику
     body = request.get_json(silent=True) or {}
     rrc = body.get("rrc", None)
 
@@ -119,7 +135,6 @@ def patch_rrc(nm_id: int):
     body = request.get_json(silent=True) or {}
     rrc = body.get("rrc", None)
 
-    # верификация входа
     if rrc in ("", None):
         val = None
     else:
