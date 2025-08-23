@@ -7,7 +7,10 @@ from db import (
     delete_product as db_delete,
     set_rrc,
     list_nm_ids_for_refresh,
-    count_needing_refresh,  # NEW
+    count_needing_refresh,
+    # NEW:
+    list_nm_ids_any,
+    count_all_rows,
 )
 
 import os
@@ -51,7 +54,6 @@ def calc_ui_price_from_product(base_price: Optional[float]) -> Optional[int]:
             ui = floor(raw / step) * step
         else:
             ui = raw
-        # Округлим вниз до целого рубля
         return int(floor(ui))
     except Exception:
         return None
@@ -71,14 +73,8 @@ def health():
 def list_products():
     try:
         items = db_list()
-        # Добавим вычисленное поле ui_price на лету
-        enriched = []
-        for it in items:
-            it = dict(it)  # не портим исходник
-            base = it.get("price_after_seller_discount")
-            it["ui_price"] = calc_ui_price_from_product(base)
-            enriched.append(it)
-        return jsonify({"items": enriched})
+        # Теперь ui_price берём из БД как есть
+        return jsonify({"items": items})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -92,6 +88,9 @@ def add_product():
         return jsonify({"ok": False, "error": "nm_id должен быть числом"}), 400
     try:
         data = fetch_wb_price(nm_id)
+        ui_price = calc_ui_price_from_product(
+            float(data.get("price_after_seller_discount") or 0)
+        )
         upsert_product(
             nm_id=data["nm_id"],
             brand=data.get("brand", "") or "",
@@ -100,6 +99,7 @@ def add_product():
             price_after=float(data.get("price_after_seller_discount") or 0),
             seller_id=data.get("seller_id"),
             seller_name=data.get("seller_name") or None,
+            ui_price=int(ui_price) if ui_price is not None else None,  # NEW
         )
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -109,6 +109,9 @@ def add_product():
 def refresh_product(nm_id: int):
     try:
         data = fetch_wb_price(nm_id)
+        ui_price = calc_ui_price_from_product(
+            float(data.get("price_after_seller_discount") or 0)
+        )
         upsert_product(
             nm_id=data["nm_id"],
             brand=data.get("brand", "") or "",
@@ -117,6 +120,7 @@ def refresh_product(nm_id: int):
             price_after=float(data.get("price_after_seller_discount") or 0),
             seller_id=data.get("seller_id"),
             seller_name=data.get("seller_name") or None,
+            ui_price=int(ui_price) if ui_price is not None else None,  # NEW
         )
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -171,13 +175,21 @@ def delete_product(nm_id: int):
 @application.post("/api/products/refresh-batch")
 def refresh_batch():
     """
-    Обновляет цены у N товаров (лимит из .env или ?limit=).
-    Берём кандидатов среди тех, кому «нужно обновление» (см. db.count_needing_refresh()).
-    Возвращаем также remaining и done, чтобы фронт мог крутить цикл до конца.
+    Пакетное обновление цен.
+    Обычный режим: выбираем тех, кому нужно обновление (см. db.list_nm_ids_for_refresh).
+    force=1: идём по всей таблице в порядке nm_id ASC с пагинацией по offset/limit.
+      Клиент передаёт offset (по умолчанию 0), сервер возвращает next_offset и done.
     """
     try:
         limit = request.args.get("limit", type=int) or BATCH_REFRESH_LIMIT
-        nm_ids = list_nm_ids_for_refresh(limit)
+        force = request.args.get("force", default="0") in ("1", "true", "True")
+        offset = request.args.get("offset", type=int) or 0
+
+        if force:
+            # детерминированно идём по nm_id с OFFSET
+            nm_ids = list_nm_ids_any(limit=limit, offset=offset)
+        else:
+            nm_ids = list_nm_ids_for_refresh(limit)
 
         updated = []
         errors = []
@@ -185,6 +197,9 @@ def refresh_batch():
         for nm_id in nm_ids:
             try:
                 data = fetch_wb_price(nm_id)
+                ui_price = calc_ui_price_from_product(
+                    float(data.get("price_after_seller_discount") or 0)
+                )
                 upsert_product(
                     nm_id=data["nm_id"],
                     brand=data.get("brand", "") or "",
@@ -193,12 +208,23 @@ def refresh_batch():
                     price_after=float(data.get("price_after_seller_discount") or 0),
                     seller_id=data.get("seller_id"),
                     seller_name=data.get("seller_name") or None,
+                    ui_price=int(ui_price) if ui_price is not None else None,
                 )
                 updated.append(nm_id)
             except Exception as e:
                 errors.append({"nm_id": nm_id, "error": str(e)})
 
-        remaining = count_needing_refresh()
+        if force:
+            total = count_all_rows()
+            next_offset = offset + len(nm_ids)
+            done = (len(nm_ids) == 0) or (next_offset >= total)
+            remaining = max(total - next_offset, 0)
+        else:
+            remaining = count_needing_refresh()
+            done = (remaining == 0)
+            next_offset = None
+            total = None
+
         return jsonify({
             "ok": True,
             "requested": limit,
@@ -207,8 +233,12 @@ def refresh_batch():
             "updated": updated,
             "errors_count": len(errors),
             "errors": errors,
-            "remaining": remaining,
-            "done": remaining == 0,
+            "remaining": remaining,   # в force это «сколько ещё строк до конца таблицы»
+            "done": done,
+            "force": force,
+            "offset": offset,
+            "next_offset": next_offset,
+            "total": total,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -218,14 +248,13 @@ def upload_xlsx():
     """
     Принимаем .xlsx, берём РРЦ из 3-го столбца (C), артикул из 4-го (D).
     Вставляем (или обновляем) строки с нулевыми ценами + выставляем rrc.
-    Никаких цен сейчас не тянем — их подтянет пакетное обновление.
+    Цены подтянет пакетное обновление.
     """
     try:
         file = request.files.get("file")
         if not file:
             return jsonify({"ok": False, "error": "Файл не передан"}), 400
 
-        # Читаем сразу из потока
         wb = load_workbook(file, read_only=True, data_only=True)
         ws = wb.active
 
@@ -254,8 +283,7 @@ def upload_xlsx():
                 if rrc_raw not in (None, ""):
                     rrc_val = float(str(rrc_raw).replace(",", ".").strip())
 
-                # создаём/обновляем строку с нулевыми ценами,
-                # чтобы потом батчем подтянуть реальные цены
+                # создаём/обновляем строку с нулевыми ценами (ui_price=None)
                 upsert_product(
                     nm_id=nm_id,
                     brand="",
@@ -264,6 +292,7 @@ def upload_xlsx():
                     price_after=0.0,
                     seller_id=None,
                     seller_name=None,
+                    ui_price=None,
                 )
                 set_rrc(nm_id, rrc_val)
                 affected += 1

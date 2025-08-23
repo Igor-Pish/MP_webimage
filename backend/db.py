@@ -20,7 +20,6 @@ DB_CFG = {
 }
 TABLE = os.getenv("DB_TABLE", "products")
 
-# Настройка «устаревания» данных для батч-обновления.
 # 0 = обновляем только пустые (price_after_seller_discount IS NULL/0)
 STALE_HOURS = int(os.getenv("STALE_HOURS", "0"))
 
@@ -44,8 +43,9 @@ def _row_to_dict(row) -> Dict:
         "seller_name": row[4],
         "price_before_discount": float(row[5]) if row[5] is not None else 0.0,
         "price_after_seller_discount": float(row[6]) if row[6] is not None else 0.0,
-        "rrc": float(row[7]) if row[7] is not None else None,
-        "updated_at": row[8].isoformat() if row[8] else None,
+        "ui_price": int(row[7]) if row[7] is not None else None,
+        "rrc": float(row[8]) if row[8] is not None else None,
+        "updated_at": row[9].isoformat() if row[9] else None,
     }
 
 def list_products() -> List[Dict]:
@@ -58,6 +58,7 @@ def list_products() -> List[Dict]:
             seller_name,
             price_before_discount,
             price_after_seller_discount,
+            ui_price,
             rrc,
             updated_at
         FROM {TABLE}
@@ -82,12 +83,13 @@ def upsert_product(
     price_after: float,
     seller_id: Optional[int] = None,
     seller_name: Optional[str] = None,
+    ui_price: Optional[int] = None,
 ) -> None:
     sql = f"""
         INSERT INTO {TABLE}
             (nm_id, brand, title, seller_id, seller_name,
-             price_before_discount, price_after_seller_discount, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+             price_before_discount, price_after_seller_discount, ui_price, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
         ON DUPLICATE KEY UPDATE
             brand = VALUES(brand),
             title = VALUES(title),
@@ -95,13 +97,14 @@ def upsert_product(
             seller_name = VALUES(seller_name),
             price_before_discount = VALUES(price_before_discount),
             price_after_seller_discount = VALUES(price_after_seller_discount),
+            ui_price = VALUES(ui_price),
             updated_at = NOW()
     """
     try:
         conn = get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, (nm_id, brand, title, seller_id, seller_name, price_before, price_after))
+                cur.execute(sql, (nm_id, brand, title, seller_id, seller_name, price_before, price_after, ui_price))
             conn.commit()
         finally:
             conn.close()
@@ -134,23 +137,14 @@ def delete_product(nm_id: int) -> None:
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_product error: {e}")
 
-# ====== Поддержка батч-обновления ======
+# ====== Поддержка батч-обновления (умный режим) ======
 def _where_need_refresh() -> str:
-    """
-    Кого считаем «нуждающимся в обновлении».
-    - всегда: пустые/нулевые price_after_seller_discount
-    - если STALE_HOURS > 0: ещё и устаревшие по updated_at
-    """
     where = "(price_after_seller_discount IS NULL OR price_after_seller_discount = 0)"
     if STALE_HOURS > 0:
         where = f"({where} OR updated_at IS NULL OR updated_at < (NOW() - INTERVAL {STALE_HOURS} HOUR))"
     return where
 
 def list_nm_ids_for_refresh(limit: int) -> List[int]:
-    """
-    Кандидаты на обновление: только те, кому «нужно обновление».
-    Сортировка: сначала те, у кого updated_at IS NULL, затем самые старые.
-    """
     where = _where_need_refresh()
     sql = f"""
         SELECT nm_id
@@ -172,9 +166,6 @@ def list_nm_ids_for_refresh(limit: int) -> List[int]:
         raise RuntimeError(f"MySQL list_nm_ids_for_refresh error: {e}")
 
 def count_needing_refresh() -> int:
-    """
-    Сколько ещё «нуждается в обновлении» (для фронтового цикла run-until-done).
-    """
     where = _where_need_refresh()
     sql = f"SELECT COUNT(*) FROM {TABLE} WHERE {where}"
     try:
@@ -188,3 +179,40 @@ def count_needing_refresh() -> int:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_needing_refresh error: {e}")
+
+# ====== Принудительный режим ======
+def list_nm_ids_any(limit: int, offset: int = 0) -> List[int]:
+    """
+    Любые товары, стабильный порядок nm_id ASC, с LIMIT/OFFSET.
+    Используется для принудительного полного прохода по таблице.
+    """
+    sql = f"""
+        SELECT nm_id
+        FROM {TABLE}
+        ORDER BY nm_id ASC
+        LIMIT %s OFFSET %s
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit, offset))
+                return [int(r[0]) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_nm_ids_any error: {e}")
+
+def count_all_rows() -> int:
+    sql = f"SELECT COUNT(*) FROM {TABLE}"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                (cnt,) = cur.fetchone()
+                return int(cnt or 0)
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL count_all_rows error: {e}")
