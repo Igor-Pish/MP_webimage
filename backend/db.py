@@ -1,17 +1,13 @@
 import os
 from typing import Optional, List, Dict
-
 from dotenv import load_dotenv
 
-# Подтягиваем .env РАНЬШЕ импортов mysql, чтобы переменные сразу были в os.environ
 load_dotenv()
 
 import mysql.connector
 from mysql.connector import pooling
 from mysql.connector import Error as MySQLError
 
-
-# Конфигурация БД из .env
 DB_CFG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "port": int(os.getenv("DB_PORT", "3306")),
@@ -24,29 +20,22 @@ DB_CFG = {
 }
 TABLE = os.getenv("DB_TABLE", "products")
 
-# Пул соединений создаём лениво, чтобы импорт модуля не падал при временной недоступности MySQL
+# Настройка «устаревания» данных для батч-обновления.
+# 0 = обновляем только пустые (price_after_seller_discount IS NULL/0)
+STALE_HOURS = int(os.getenv("STALE_HOURS", "0"))
+
 _pool: Optional[pooling.MySQLConnectionPool] = None
 
-
 def _ensure_pool() -> None:
-    """Создаёт пул подключений при первом обращении."""
     global _pool
     if _pool is None:
-        # pool_size можно увеличить, если у вас много одновременных запросов
         _pool = pooling.MySQLConnectionPool(pool_name="mp_pool", pool_size=5, **DB_CFG)
 
-
 def get_conn():
-    """Берёт соединение из пула."""
     _ensure_pool()
     return _pool.get_connection()
 
-
 def _row_to_dict(row) -> Dict:
-    """
-    Маппинг строки -> dict.
-    ПОРЯДОК ДОЛЖЕН СОВПАДАТЬ с SELECT в list_products().
-    """
     return {
         "nm_id": row[0],
         "brand": row[1],
@@ -59,11 +48,7 @@ def _row_to_dict(row) -> Dict:
         "updated_at": row[8].isoformat() if row[8] else None,
     }
 
-
 def list_products() -> List[Dict]:
-    """
-    Возвращает все товары из таблицы, отсортированные по nm_id.
-    """
     sql = f"""
         SELECT
             nm_id,
@@ -87,9 +72,7 @@ def list_products() -> List[Dict]:
         finally:
             conn.close()
     except MySQLError as e:
-        # Прокидываем читаемую ошибку наверх — Flask вернёт 500 с текстом
         raise RuntimeError(f"MySQL list_products error: {e}")
-
 
 def upsert_product(
     nm_id: int,
@@ -125,12 +108,7 @@ def upsert_product(
     except MySQLError as e:
         raise RuntimeError(f"MySQL upsert_product error: {e}")
 
-
 def set_rrc(nm_id: int, rrc: Optional[float]) -> None:
-    """
-    Ставит/очищает РРЦ.
-    rrc = None -> NULL в БД.
-    """
     sql = f"UPDATE {TABLE} SET rrc=%s, updated_at=NOW() WHERE nm_id=%s"
     try:
         conn = get_conn()
@@ -143,11 +121,7 @@ def set_rrc(nm_id: int, rrc: Optional[float]) -> None:
     except MySQLError as e:
         raise RuntimeError(f"MySQL set_rrc error: {e}")
 
-
 def delete_product(nm_id: int) -> None:
-    """
-    Удаляет товар по nm_id. Идемпотентно: если нет — просто 0 затронутых строк.
-    """
     sql = f"DELETE FROM {TABLE} WHERE nm_id=%s"
     try:
         conn = get_conn()
@@ -159,3 +133,58 @@ def delete_product(nm_id: int) -> None:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_product error: {e}")
+
+# ====== Поддержка батч-обновления ======
+def _where_need_refresh() -> str:
+    """
+    Кого считаем «нуждающимся в обновлении».
+    - всегда: пустые/нулевые price_after_seller_discount
+    - если STALE_HOURS > 0: ещё и устаревшие по updated_at
+    """
+    where = "(price_after_seller_discount IS NULL OR price_after_seller_discount = 0)"
+    if STALE_HOURS > 0:
+        where = f"({where} OR updated_at IS NULL OR updated_at < (NOW() - INTERVAL {STALE_HOURS} HOUR))"
+    return where
+
+def list_nm_ids_for_refresh(limit: int) -> List[int]:
+    """
+    Кандидаты на обновление: только те, кому «нужно обновление».
+    Сортировка: сначала те, у кого updated_at IS NULL, затем самые старые.
+    """
+    where = _where_need_refresh()
+    sql = f"""
+        SELECT nm_id
+        FROM {TABLE}
+        WHERE {where}
+        ORDER BY (updated_at IS NULL) DESC, updated_at ASC, nm_id ASC
+        LIMIT %s
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit,))
+                rows = cur.fetchall()
+                return [int(r[0]) for r in rows]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_nm_ids_for_refresh error: {e}")
+
+def count_needing_refresh() -> int:
+    """
+    Сколько ещё «нуждается в обновлении» (для фронтового цикла run-until-done).
+    """
+    where = _where_need_refresh()
+    sql = f"SELECT COUNT(*) FROM {TABLE} WHERE {where}"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                (cnt,) = cur.fetchone()
+                return int(cnt or 0)
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL count_needing_refresh error: {e}")
