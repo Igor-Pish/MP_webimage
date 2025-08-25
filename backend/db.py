@@ -270,3 +270,43 @@ def list_sellers_with_violations() -> List[Dict]:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_sellers_with_violations error: {e}")
+    
+# ====== Telegram admins ======
+def list_admin_chat_ids():
+    sql = "SELECT chat_id FROM tg_admins"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                return [int(r[0]) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_admin_chat_ids error: {e}")
+
+def upsert_admin(chat_id, username=None):
+    sql = "INSERT INTO tg_admins (chat_id, username) VALUES (%s, %s) ON DUPLICATE KEY UPDATE username = VALUES(username)"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(chat_id), username))
+            conn.commit()
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL upsert_admin error: {e}")
+
+def delete_admin(chat_id):
+    sql = "DELETE FROM tg_admins WHERE chat_id=%s"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(chat_id),))
+            conn.commit()
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL delete_admin error: {e}")
