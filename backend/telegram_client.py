@@ -1,7 +1,7 @@
 import os
 import requests
 
-from db import list_admin_chat_ids  # <-- берём список админов из БД
+from db import list_admin_chat_ids
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 

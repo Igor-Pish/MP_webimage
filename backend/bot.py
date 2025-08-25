@@ -8,7 +8,7 @@ from aiogram.utils import executor
 from aiogram.dispatcher.filters import CommandStart, Command
 
 # работаем напрямую с БД (как просил)
-from db import list_admin_chat_ids, upsert_admin, delete_admin
+from db import list_admin_chat_ids, upsert_admin, delete_admin, get_seller_name
 
 load_dotenv()
 
@@ -149,7 +149,11 @@ async def on_send_articles(cb: types.CallbackQuery):
     chunk = 70
     for i in range(0, len(nm_ids), chunk):
         part = ", ".join(nm_ids[i:i + chunk])
-        await cb.message.answer("Артикулы:\n" + part)
+        seller_link = f"https://www.wildberries.ru/seller/{seller_id}"
+        seller_name = get_seller_name(seller_id)
+        title = seller_name or ("ID %s" % seller_id)
+        text = ("Артикулы продавца <a href=\"%s\">%s</a>:\n") % (seller_link, title)
+        await cb.message.answer(text + part)
 
 def main():
     if not BOT_TOKEN:

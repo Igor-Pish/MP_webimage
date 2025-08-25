@@ -270,6 +270,20 @@ def list_sellers_with_violations() -> List[Dict]:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_sellers_with_violations error: {e}")
+
+def get_seller_name(seller_id: int) -> Optional[str]:
+    sql = f"SELECT MAX(seller_name) FROM {TABLE} WHERE seller_id=%s"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (seller_id,))
+                (name,) = cur.fetchone()
+                return name
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL get_seller_name error: {e}")
     
 # ====== Telegram admins ======
 def list_admin_chat_ids():
