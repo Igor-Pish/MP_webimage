@@ -8,10 +8,10 @@ from db import (
     set_rrc,
     list_nm_ids_for_refresh,
     count_needing_refresh,
-    # NEW:
-    list_nm_ids_any,
-    count_all_rows,
+    list_sellers_with_violations,
 )
+
+from telegram_client import send_violation_alert
 
 import os
 from math import floor
@@ -72,8 +72,8 @@ def health():
 @application.get("/api/products")
 def list_products():
     try:
+        # Возвращаем как есть из БД (ui_price хранится в таблице)
         items = db_list()
-        # Теперь ui_price берём из БД как есть
         return jsonify({"items": items})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -99,7 +99,7 @@ def add_product():
             price_after=float(data.get("price_after_seller_discount") or 0),
             seller_id=data.get("seller_id"),
             seller_name=data.get("seller_name") or None,
-            ui_price=int(ui_price) if ui_price is not None else None,  # NEW
+            ui_price=int(ui_price) if ui_price is not None else None,
         )
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -120,7 +120,7 @@ def refresh_product(nm_id: int):
             price_after=float(data.get("price_after_seller_discount") or 0),
             seller_id=data.get("seller_id"),
             seller_name=data.get("seller_name") or None,
-            ui_price=int(ui_price) if ui_price is not None else None,  # NEW
+            ui_price=int(ui_price) if ui_price is not None else None,
         )
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -175,21 +175,13 @@ def delete_product(nm_id: int):
 @application.post("/api/products/refresh-batch")
 def refresh_batch():
     """
-    Пакетное обновление цен.
-    Обычный режим: выбираем тех, кому нужно обновление (см. db.list_nm_ids_for_refresh).
-    force=1: идём по всей таблице в порядке nm_id ASC с пагинацией по offset/limit.
-      Клиент передаёт offset (по умолчанию 0), сервер возвращает next_offset и done.
+    Обновляет цены у N товаров (лимит из .env или ?limit=).
+    Берём кандидатов среди тех, кому «нужно обновление».
+    Возвращаем remaining и done, чтобы фронт мог крутить цикл до конца.
     """
     try:
         limit = request.args.get("limit", type=int) or BATCH_REFRESH_LIMIT
-        force = request.args.get("force", default="0") in ("1", "true", "True")
-        offset = request.args.get("offset", type=int) or 0
-
-        if force:
-            # детерминированно идём по nm_id с OFFSET
-            nm_ids = list_nm_ids_any(limit=limit, offset=offset)
-        else:
-            nm_ids = list_nm_ids_for_refresh(limit)
+        nm_ids = list_nm_ids_for_refresh(limit)
 
         updated = []
         errors = []
@@ -214,16 +206,15 @@ def refresh_batch():
             except Exception as e:
                 errors.append({"nm_id": nm_id, "error": str(e)})
 
-        if force:
-            total = count_all_rows()
-            next_offset = offset + len(nm_ids)
-            done = (len(nm_ids) == 0) or (next_offset >= total)
-            remaining = max(total - next_offset, 0)
-        else:
-            remaining = count_needing_refresh()
-            done = (remaining == 0)
-            next_offset = None
-            total = None
+        # после обновления цен — проверка нарушителей и уведомление
+        remaining = count_needing_refresh()
+        try:
+            violators = list_sellers_with_violations()
+            for v in violators:
+                send_violation_alert(v["seller_id"], v.get("seller_name"))
+        except Exception as e:
+            # не роняем запрос из-за алертов
+            print(f"[alerts] send error: {e}")
 
         return jsonify({
             "ok": True,
@@ -233,12 +224,8 @@ def refresh_batch():
             "updated": updated,
             "errors_count": len(errors),
             "errors": errors,
-            "remaining": remaining,   # в force это «сколько ещё строк до конца таблицы»
-            "done": done,
-            "force": force,
-            "offset": offset,
-            "next_offset": next_offset,
-            "total": total,
+            "remaining": remaining,
+            "done": remaining == 0,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -263,7 +250,7 @@ def upload_xlsx():
         skipped = 0
         errors = 0
 
-        for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        for _, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
             total += 1
             rrc_raw = row[2] if len(row) > 2 else None   # C
             nm_raw  = row[3] if len(row) > 3 else None   # D
@@ -307,6 +294,21 @@ def upload_xlsx():
             "errors_count": errors,
         })
 
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@application.get("/api/sellers/<int:seller_id>/violations")
+def seller_violations(seller_id: int):
+    """
+    Возвращает список артикулов с нарушением для селлера.
+    Критерий: ui_price < rrc (оба не NULL/0).
+    Формат: { items: [ { nm_id }, ... ] }
+    """
+    try:
+        from db import list_violations_for_seller
+        rows = list_violations_for_seller(seller_id)
+        return jsonify({"items": rows})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

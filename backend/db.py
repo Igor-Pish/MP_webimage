@@ -1,5 +1,5 @@
 import os
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -137,7 +137,7 @@ def delete_product(nm_id: int) -> None:
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_product error: {e}")
 
-# ====== Поддержка батч-обновления (умный режим) ======
+# ====== Поддержка батч-обновления ======
 def _where_need_refresh() -> str:
     where = "(price_after_seller_discount IS NULL OR price_after_seller_discount = 0)"
     if STALE_HOURS > 0:
@@ -180,7 +180,6 @@ def count_needing_refresh() -> int:
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_needing_refresh error: {e}")
 
-# ====== Принудительный режим ======
 def list_nm_ids_any(limit: int, offset: int = 0) -> List[int]:
     """
     Любые товары, стабильный порядок nm_id ASC, с LIMIT/OFFSET.
@@ -216,3 +215,58 @@ def count_all_rows() -> int:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_all_rows error: {e}")
+
+# ====== Для алармов: выборка нарушителей и их артикулов ======
+def list_violations_for_seller(seller_id: int) -> List[Dict]:
+    """
+    Нарушения у селлера: ui_price < rrc и оба заданы.
+    Возвращает [{'nm_id': ...}, ...]
+    """
+    sql = f"""
+        SELECT nm_id
+        FROM {TABLE}
+        WHERE seller_id = %s
+          AND ui_price IS NOT NULL AND ui_price > 0
+          AND rrc IS NOT NULL AND rrc > 0
+          AND ui_price < rrc
+        ORDER BY nm_id
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (seller_id,))
+                return [{"nm_id": int(r[0])} for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_violations_for_seller error: {e}")
+
+def list_sellers_with_violations() -> List[Dict]:
+    """
+    Селлеры, у которых есть хотя бы одно нарушение.
+    Возвращает [{'seller_id': ..., 'seller_name': ..., 'violations': N}, ...]
+    """
+    sql = f"""
+        SELECT seller_id, MAX(seller_name) as seller_name, COUNT(*) as cnt
+        FROM {TABLE}
+        WHERE ui_price IS NOT NULL AND ui_price > 0
+          AND rrc IS NOT NULL AND rrc > 0
+          AND ui_price < rrc
+        GROUP BY seller_id
+        ORDER BY cnt DESC
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                return [
+                    {"seller_id": int(r[0]), "seller_name": r[1], "violations": int(r[2])}
+                    for r in rows
+                ]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_sellers_with_violations error: {e}")
