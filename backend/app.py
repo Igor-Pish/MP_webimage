@@ -9,6 +9,7 @@ from db import (
     list_nm_ids_for_refresh,
     count_needing_refresh,
     list_sellers_with_violations,
+    delete_all_products,
 )
 
 from telegram_client import send_violation_alert
@@ -227,6 +228,17 @@ def refresh_batch():
             "remaining": remaining,
             "done": remaining == 0,
         })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    
+@application.delete("/api/products")
+def delete_all():
+    """
+    Удаляет все товары из БД.
+    """
+    try:
+        removed = delete_all_products()
+        return jsonify({"ok": True, "removed": removed})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

@@ -137,6 +137,25 @@ def delete_product(nm_id: int) -> None:
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_product error: {e}")
 
+def delete_all_products() -> int:
+    """
+    Удаляет все товары из таблицы.
+    Возвращает количество удалённых строк (может быть недоступно для некоторых драйверов).
+    """
+    sql = f"DELETE FROM {TABLE}"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                affected = cur.rowcount if cur.rowcount is not None else 0
+            conn.commit()
+            return int(affected or 0)
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL delete_all_products error: {e}")
+
 # ====== Поддержка батч-обновления ======
 def _where_need_refresh() -> str:
     where = "(price_after_seller_discount IS NULL OR price_after_seller_discount = 0)"
