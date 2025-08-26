@@ -12,6 +12,8 @@ from db import (
     delete_all_products,
 )
 
+from utils import calc_rrc_from_title, _parse_nm_id, _parse_price_like, _detect_columns
+
 from telegram_client import send_violation_alert
 
 import os
@@ -89,6 +91,7 @@ def add_product():
         return jsonify({"ok": False, "error": "nm_id должен быть числом"}), 400
     try:
         data = fetch_wb_price(nm_id)
+        rrc_auto = calc_rrc_from_title(data.get("title"))
         ui_price = calc_ui_price_from_product(
             float(data.get("price_after_seller_discount") or 0)
         )
@@ -102,6 +105,10 @@ def add_product():
             seller_name=data.get("seller_name") or None,
             ui_price=int(ui_price) if ui_price is not None else None,
         )
+
+        if rrc_auto is not None:
+            set_rrc(nm_id, rrc_auto)
+
         return jsonify({"ok": True, "item": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -110,6 +117,7 @@ def add_product():
 def refresh_product(nm_id: int):
     try:
         data = fetch_wb_price(nm_id)
+        rrc_auto = calc_rrc_from_title(data.get("title"))
         ui_price = calc_ui_price_from_product(
             float(data.get("price_after_seller_discount") or 0)
         )
@@ -123,6 +131,10 @@ def refresh_product(nm_id: int):
             seller_name=data.get("seller_name") or None,
             ui_price=int(ui_price) if ui_price is not None else None,
         )
+
+        if rrc_auto is not None:
+            set_rrc(nm_id, rrc_auto)
+        
         return jsonify({"ok": True, "item": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -190,6 +202,7 @@ def refresh_batch():
         for nm_id in nm_ids:
             try:
                 data = fetch_wb_price(nm_id)
+                rrc_auto = calc_rrc_from_title(data.get("title"))
                 ui_price = calc_ui_price_from_product(
                     float(data.get("price_after_seller_discount") or 0)
                 )
@@ -203,6 +216,10 @@ def refresh_batch():
                     seller_name=data.get("seller_name") or None,
                     ui_price=int(ui_price) if ui_price is not None else None,
                 )
+
+                if rrc_auto is not None:
+                    set_rrc(nm_id, rrc_auto)
+
                 updated.append(nm_id)
             except Exception as e:
                 errors.append({"nm_id": nm_id, "error": str(e)})
@@ -245,9 +262,12 @@ def delete_all():
 @application.post("/api/upload-xlsx")
 def upload_xlsx():
     """
-    Принимаем .xlsx, берём РРЦ из 3-го столбца (C), артикул из 4-го (D).
-    Вставляем (или обновляем) строки с нулевыми ценами + выставляем rrc.
-    Цены подтянет пакетное обновление.
+    Импорт XLSX c «умным» поиском колонок.
+    - Сначала ищем по заголовку: Артикул / РРЦ.
+    - Если не нашли, определяем эвристически:
+        * Артикул: колонка с макс. числом «похожих на nm_id»
+        * РРЦ: колонка, где большинство значений ∈ {1300, 1500} (или просто числовая колонка)
+    - Если РРЦ не нашли — импортируем только nm_id (РРЦ остаётся как есть).
     """
     try:
         file = request.files.get("file")
@@ -257,34 +277,43 @@ def upload_xlsx():
         wb = load_workbook(file, read_only=True, data_only=True)
         ws = wb.active
 
+        nm_col_arg = request.args.get("nm_col", type=int)
+        rrc_col_arg = request.args.get("rrc_col", type=int)
+
+        # Автоопределение колонок
+        if nm_col_arg is not None or rrc_col_arg is not None:
+            idx_nm, idx_rrc = nm_col_arg, rrc_col_arg
+        else:
+            idx_nm, idx_rrc = _detect_columns(ws)
+
         total = 0
         affected = 0
         skipped = 0
         errors = 0
 
-        for _, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        # Перебираем строки
+        for row in ws.iter_rows(min_row=2, values_only=True):
             total += 1
-            rrc_raw = row[2] if len(row) > 2 else None   # C
-            nm_raw  = row[3] if len(row) > 3 else None   # D
 
-            if nm_raw is None:
+            nm_val = None
+            if idx_nm is not None and idx_nm < len(row):
+                nm_val = _parse_nm_id(row[idx_nm])
+
+            if not nm_val:
                 skipped += 1
                 continue
 
-            try:
-                nm_id = int(str(nm_raw).strip())
-            except Exception:
-                skipped += 1
-                continue
+            rrc_val = None
+            if idx_rrc is not None and idx_rrc < len(row):
+                rrc_parsed = _parse_price_like(row[idx_rrc])
+                if rrc_parsed is not None:
+                    rrc_val = float(int(round(rrc_parsed)))  # до целых рублей
 
             try:
-                rrc_val = None
-                if rrc_raw not in (None, ""):
-                    rrc_val = float(str(rrc_raw).replace(",", ".").strip())
-
-                # создаём/обновляем строку с нулевыми ценами (ui_price=None)
+                # создаём/обновляем строку с нулевыми ценами (ui_price=None),
+                # реальную цену подтянет батч-обновление
                 upsert_product(
-                    nm_id=nm_id,
+                    nm_id=nm_val,
                     brand="",
                     title="",
                     price_before=0.0,
@@ -293,7 +322,8 @@ def upload_xlsx():
                     seller_name=None,
                     ui_price=None,
                 )
-                set_rrc(nm_id, rrc_val)
+                if rrc_val is not None:
+                    set_rrc(nm_val, rrc_val)
                 affected += 1
             except Exception:
                 errors += 1
@@ -304,6 +334,12 @@ def upload_xlsx():
             "affected": affected,
             "skipped": skipped,
             "errors_count": errors,
+            "columns": {
+                "nm_idx": idx_nm,
+                "rrc_idx": idx_rrc,
+                "header_nm": (ws.cell(row=1, column=(idx_nm+1)).value if idx_nm is not None else None),
+                "header_rrc": (ws.cell(row=1, column=(idx_rrc+1)).value if idx_rrc is not None else None),
+            }
         })
 
     except Exception as e:
