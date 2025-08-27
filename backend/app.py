@@ -11,6 +11,7 @@ from db import (
     list_sellers_with_violations,
     delete_all_products,
 )
+from db import count_all_rows, count_violations, count_needing_refresh
 
 from utils import calc_rrc_from_title, _parse_nm_id, _parse_price_like, _detect_columns
 
@@ -21,8 +22,29 @@ from math import floor
 from typing import Optional
 from dotenv import load_dotenv
 from openpyxl import load_workbook
+import time
 
 load_dotenv()  # загрузим .env заранее
+
+WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "9"))
+WORK_END_HOUR   = int(os.getenv("WORK_END_HOUR", "20"))
+WORK_TZ_OFFSET  = int(os.getenv("WORK_TZ_OFFSET", "0"))  # смещение в часах от UTC
+ALERTS_PENDING = False
+
+def now_local_hour() -> int:
+    """
+    Текущее «локальное» время = системное + смещение WORK_TZ_OFFSET, в часах 0..23.
+    """
+    t = time.time() + WORK_TZ_OFFSET * 3600
+    return time.gmtime(t).tm_hour
+
+def is_work_time() -> bool:
+    h = now_local_hour()
+    # интервал [start, end)
+    if WORK_START_HOUR <= WORK_END_HOUR:
+        return WORK_START_HOUR <= h < WORK_END_HOUR
+    # если вдруг задали «через полночь»
+    return h >= WORK_START_HOUR or h < WORK_END_HOUR
 
 # ====== Параметры для расчёта фиолетовой цены ======
 UI_WALLET_PERCENT = float(os.getenv("UI_WALLET_PERCENT", "0"))        # 0.02 => 2%
@@ -48,6 +70,8 @@ def calc_ui_price_from_product(base_price: Optional[float]) -> Optional[int]:
         return None
     try:
         base = float(base_price)
+        if base <= 0:
+            return None
         p = UI_WALLET_PERCENT
         thr = UI_ROUND_THRESHOLD
         step = UI_ROUND_STEP if UI_ROUND_STEP > 0 else 1.0
@@ -60,6 +84,19 @@ def calc_ui_price_from_product(base_price: Optional[float]) -> Optional[int]:
         return int(floor(ui))
     except Exception:
         return None
+
+def _infer_unavailable(data: dict) -> bool:
+    """
+    Эвристика: считаем товар недоступным если:
+    - явный флаг из парсера (in_stock/available == False), или
+    - нет/ноль цены after_seller_discount и before_discount.
+    """
+    for k in ("in_stock", "available"):
+        if k in data and data.get(k) is False:
+            return True
+    pa = float(data.get("price_after_seller_discount") or 0)
+    pb = float(data.get("price_before_discount") or 0)
+    return (pa <= 0 and pb <= 0)
 
 application = Flask(__name__)
 CORS(
@@ -74,10 +111,61 @@ def health():
 
 @application.get("/api/products")
 def list_products():
+    """
+    Пагинация:
+      ?limit=100&offset=0&only_violations=0|1&sort=nm_id|seller_name|price_after_seller_discount&dir=asc|desc
+    """
     try:
-        # Возвращаем как есть из БД (ui_price хранится в таблице)
-        items = db_list()
-        return jsonify({"items": items})
+        limit = request.args.get("limit", default=100, type=int)
+        offset = request.args.get("offset", default=0, type=int)
+        only_viol = request.args.get("only_violations", default=0, type=int)
+        sort = (request.args.get("sort") or "nm_id").strip()
+        dir_ = (request.args.get("dir") or "asc").strip().lower()
+
+        # guardrails
+        if limit < 1: limit = 100
+        if limit > 500: limit = 500
+        if offset < 0: offset = 0
+        if dir_ not in ("asc", "desc"): dir_ = "asc"
+
+        # белый список сортировки: ключ -> SQL-колонка
+        sort_map = {
+            "nm_id": "nm_id",
+            "seller_name": "seller_name",
+            "price_after_seller_discount": "price_after_seller_discount",
+            "updated_at": "updated_at",
+            "rrc": "rrc",
+        }
+        sort_col = sort_map.get(sort, "nm_id")
+
+        from db import (
+            list_products_page,
+            list_products_page_violations,
+            count_all_rows,
+            count_violations,
+        )
+
+        if only_viol:
+            total_rows = count_violations()
+            items = list_products_page_violations(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_)
+        else:
+            total_rows = count_all_rows()
+            items = list_products_page(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_)
+
+        page = (offset // limit) + 1
+        total_pages = (total_rows + limit - 1) // limit
+
+        return jsonify({
+            "items": items,
+            "limit": limit,
+            "offset": offset,
+            "page": page,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "only_violations": 1 if only_viol else 0,
+            "sort": sort,
+            "dir": dir_,
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -91,23 +179,39 @@ def add_product():
         return jsonify({"ok": False, "error": "nm_id должен быть числом"}), 400
     try:
         data = fetch_wb_price(nm_id)
+        unavail = _infer_unavailable(data)
+
         rrc_auto = calc_rrc_from_title(data.get("title"))
-        ui_price = calc_ui_price_from_product(
-            float(data.get("price_after_seller_discount") or 0)
-        )
-        upsert_product(
-            nm_id=data["nm_id"],
-            brand=data.get("brand", "") or "",
-            title=data.get("title", "") or "",
-            price_before=float(data.get("price_before_discount") or 0),
-            price_after=float(data.get("price_after_seller_discount") or 0),
-            seller_id=data.get("seller_id"),
-            seller_name=data.get("seller_name") or None,
-            ui_price=int(ui_price) if ui_price is not None else None,
-        )
+
+        if unavail:
+            # помечаем как «проверено, но нет в наличии» → не зациклится
+            upsert_product(
+                nm_id=data["nm_id"],
+                brand=data.get("brand", "") or "",
+                title=data.get("title", "") or "",
+                price_before=0.0,
+                price_after=-1.0,
+                seller_id=data.get("seller_id"),
+                seller_name=data.get("seller_name") or None,
+                ui_price=None,
+            )
+        else:
+            ui_price = calc_ui_price_from_product(
+                float(data.get("price_after_seller_discount") or 0)
+            )
+            upsert_product(
+                nm_id=data["nm_id"],
+                brand=data.get("brand", "") or "",
+                title=data.get("title", "") or "",
+                price_before=float(data.get("price_before_discount") or 0),
+                price_after=float(data.get("price_after_seller_discount") or 0),
+                seller_id=data.get("seller_id"),
+                seller_name=data.get("seller_name") or None,
+                ui_price=int(ui_price) if ui_price is not None else None,
+            )
 
         if rrc_auto is not None:
-            set_rrc(nm_id, rrc_auto)
+            set_rrc(data["nm_id"], rrc_auto)
 
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -117,23 +221,39 @@ def add_product():
 def refresh_product(nm_id: int):
     try:
         data = fetch_wb_price(nm_id)
+        unavail = _infer_unavailable(data)
+
         rrc_auto = calc_rrc_from_title(data.get("title"))
-        ui_price = calc_ui_price_from_product(
-            float(data.get("price_after_seller_discount") or 0)
-        )
-        upsert_product(
-            nm_id=data["nm_id"],
-            brand=data.get("brand", "") or "",
-            title=data.get("title", "") or "",
-            price_before=float(data.get("price_before_discount") or 0),
-            price_after=float(data.get("price_after_seller_discount") or 0),
-            seller_id=data.get("seller_id"),
-            seller_name=data.get("seller_name") or None,
-            ui_price=int(ui_price) if ui_price is not None else None,
-        )
+
+        if unavail:
+            # помечаем как «проверено, но нет в наличии» → не зациклится
+            upsert_product(
+                nm_id=data["nm_id"],
+                brand=data.get("brand", "") or "",
+                title=data.get("title", "") or "",
+                price_before=0.0,
+                price_after=-1.0,
+                seller_id=data.get("seller_id"),
+                seller_name=data.get("seller_name") or None,
+                ui_price=None,
+            )
+        else:
+            ui_price = calc_ui_price_from_product(
+                float(data.get("price_after_seller_discount") or 0)
+            )
+            upsert_product(
+                nm_id=data["nm_id"],
+                brand=data.get("brand", "") or "",
+                title=data.get("title", "") or "",
+                price_before=float(data.get("price_before_discount") or 0),
+                price_after=float(data.get("price_after_seller_discount") or 0),
+                seller_id=data.get("seller_id"),
+                seller_name=data.get("seller_name") or None,
+                ui_price=int(ui_price) if ui_price is not None else None,
+            )
 
         if rrc_auto is not None:
-            set_rrc(nm_id, rrc_auto)
+            set_rrc(data["nm_id"], rrc_auto)
         
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -193,7 +313,7 @@ def refresh_batch():
     Возвращаем remaining и done, чтобы фронт мог крутить цикл до конца.
     """
     try:
-        limit = request.args.get("limit", type=int) or BATCH_REFRESH_LIMIT
+        limit = BATCH_REFRESH_LIMIT
         nm_ids = list_nm_ids_for_refresh(limit)
 
         updated = []
@@ -202,23 +322,39 @@ def refresh_batch():
         for nm_id in nm_ids:
             try:
                 data = fetch_wb_price(nm_id)
+                unavail = _infer_unavailable(data)
+
                 rrc_auto = calc_rrc_from_title(data.get("title"))
-                ui_price = calc_ui_price_from_product(
-                    float(data.get("price_after_seller_discount") or 0)
-                )
-                upsert_product(
-                    nm_id=data["nm_id"],
-                    brand=data.get("brand", "") or "",
-                    title=data.get("title", "") or "",
-                    price_before=float(data.get("price_before_discount") or 0),
-                    price_after=float(data.get("price_after_seller_discount") or 0),
-                    seller_id=data.get("seller_id"),
-                    seller_name=data.get("seller_name") or None,
-                    ui_price=int(ui_price) if ui_price is not None else None,
-                )
+
+                if unavail:
+                    # помечаем как «проверено, но нет в наличии» → не зациклится
+                    upsert_product(
+                        nm_id=data["nm_id"],
+                        brand=data.get("brand", "") or "",
+                        title=data.get("title", "") or "",
+                        price_before=0.0,
+                        price_after=-1.0,
+                        seller_id=data.get("seller_id"),
+                        seller_name=data.get("seller_name") or None,
+                        ui_price=None,
+                    )
+                else:
+                    ui_price = calc_ui_price_from_product(
+                        float(data.get("price_after_seller_discount") or 0)
+                    )
+                    upsert_product(
+                        nm_id=data["nm_id"],
+                        brand=data.get("brand", "") or "",
+                        title=data.get("title", "") or "",
+                        price_before=float(data.get("price_before_discount") or 0),
+                        price_after=float(data.get("price_after_seller_discount") or 0),
+                        seller_id=data.get("seller_id"),
+                        seller_name=data.get("seller_name") or None,
+                        ui_price=int(ui_price) if ui_price is not None else None,
+                    )
 
                 if rrc_auto is not None:
-                    set_rrc(nm_id, rrc_auto)
+                    set_rrc(data["nm_id"], rrc_auto)
 
                 updated.append(nm_id)
             except Exception as e:
@@ -226,13 +362,22 @@ def refresh_batch():
 
         # после обновления цен — проверка нарушителей и уведомление
         remaining = count_needing_refresh()
-        try:
-            violators = list_sellers_with_violations()
-            for v in violators:
-                send_violation_alert(v["seller_id"], v.get("seller_name"))
-        except Exception as e:
-            # не роняем запрос из-за алертов
-            print(f"[alerts] send error: {e}")
+
+        # ----- Рассылка только по окончанию полного обновления -----
+        global ALERTS_PENDING
+        if remaining == 0:
+            ALERTS_PENDING = True
+
+            if is_work_time():
+                try:
+                    violators = list_sellers_with_violations()
+                    for v in violators:
+                        send_violation_alert(v["seller_id"], v.get("seller_name"))
+                    ALERTS_PENDING = False  # успешно отослали
+                except Exception as e:
+                    # не роняем запрос из-за телеги
+                    print(f"[alerts] send error: {e}")
+        # ---------------------------------------
 
         return jsonify({
             "ok": True,
@@ -357,6 +502,24 @@ def seller_violations(seller_id: int):
         from db import list_violations_for_seller
         rows = list_violations_for_seller(seller_id)
         return jsonify({"items": rows})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@application.get("/api/stats")
+def stats():
+    """
+    Сводка для UI: всего строк, нарушителей, сколько ещё нуждается в обновлении.
+    """
+    try:
+        total_rows = count_all_rows()
+        viol_count = count_violations()
+        remaining = count_needing_refresh()
+        return jsonify({
+            "ok": True,
+            "total_rows": total_rows,
+            "violations": viol_count,
+            "needing_refresh": remaining,
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

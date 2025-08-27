@@ -12,12 +12,13 @@ SESSION.headers.update({
 
 def fetch_wb_price(nm_id: int) -> dict:
     """
-    Возвращаем цены из sizes[].price:
-      - price_before_discount  ← price.basic / 100   (до скидки)
-      - price_after_seller_discount ← price.product / 100 (итоговая)
-    Если price в первом размере пустой — ищем в следующем.
+    Возвращаем:
+      - price_before_discount  ← price.basic / 100
+      - price_after_seller_discount ← price.product / 100
+    Если в карточке НЕТ ни одного размера с валидной ценой — возвращаем price_after_seller_discount = -1
+    (сентинел «нет в продаже/цена недоступна»).
     """
-    url = (f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&lang=ru&nm={nm_id}")
+    url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&lang=ru&nm={nm_id}"
 
     r = SESSION.get(url, timeout=15)
     r.raise_for_status()
@@ -25,14 +26,33 @@ def fetch_wb_price(nm_id: int) -> dict:
 
     try:
         product = data["data"]["products"][0]
-        price_before_discount = product["sizes"][0]["price"]["basic"] / 100
-        price_after_seller_discount = product["sizes"][0]["price"]["product"] / 100
-
-        # НОВОЕ: селлер
-        seller_id = product.get("supplierId")
-        seller_name = product.get("supplier")
     except (KeyError, IndexError):
+        # реально нет карточки
         raise ValueError(f"Товар с nm_id={nm_id} не найден")
+
+    # селлер
+    seller_id = product.get("supplierId")
+    seller_name = product.get("supplier")
+
+    # пробегаемся по всем размерам и берём первый валидный прайс
+    price_before_discount = None
+    price_after_seller_discount = None
+
+    for s in product.get("sizes", []) or []:
+        pr = (s or {}).get("price") or {}
+        basic = pr.get("basic")
+        prod = pr.get("product")
+
+        # оба числа существуют и > 0
+        if isinstance(basic, (int, float)) and isinstance(prod, (int, float)) and basic > 0 and prod > 0:
+            price_before_discount = basic / 100.0
+            price_after_seller_discount = prod / 100.0
+            break
+
+    # если ни в одном размере нет цены — помечаем как «нет в продаже»
+    if price_after_seller_discount is None:
+        price_before_discount = 0.0
+        price_after_seller_discount = -1.0
 
     return {
         "nm_id": nm_id,

@@ -67,7 +67,14 @@ def calc_rrc_from_title(title: Optional[str]) -> Optional[float]:
     n = extract_max_relevant_number(title)
     if n is None:
         return None
-    return 1300.0 if n < 700 else 1500.0
+    if n <= 0:
+        return None
+    elif n > 800:
+        return None
+    elif n < 700:
+        return 1300.0
+    else:
+        return 1500.0
 
 # --- ВСПОМОГАЮЩИЕ ФУНКЦИИ ДЛЯ XLSX --- #
 

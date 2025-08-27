@@ -343,3 +343,115 @@ def delete_admin(chat_id):
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_admin error: {e}")
+
+# ====== Пагинация для фронтенда ======
+def list_products_page_violations(per_page: int, offset: int) -> List[Dict]:
+    sql = f"""
+        SELECT
+            nm_id,
+            brand,
+            title,
+            seller_id,
+            seller_name,
+            price_before_discount,
+            price_after_seller_discount,
+            ui_price,
+            rrc,
+            updated_at
+        FROM {TABLE}
+        WHERE ui_price IS NOT NULL AND ui_price > 0
+          AND rrc IS NOT NULL AND rrc > 0
+          AND ui_price < rrc
+        ORDER BY nm_id
+        LIMIT %s OFFSET %s
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (per_page, offset))
+                return [_row_to_dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_products_page_violations error: {e}")
+    
+def _sanitize_order(order_by: str, order_dir: str) -> Tuple[str, str]:
+    # Белый список колонок для сортировки
+    allowed = {
+        "nm_id": "nm_id",
+        "seller_name": "seller_name",
+        "price_after_seller_discount": "price_after_seller_discount",
+        "updated_at": "updated_at",
+        "rrc": "rrc",
+    }
+    col = allowed.get(order_by, "nm_id")
+    dir_ = "DESC" if (order_dir or "").lower() == "desc" else "ASC"
+    return col, dir_
+
+def list_products_page(limit: int, offset: int, order_by: str = "nm_id", order_dir: str = "asc") -> List[Dict]:
+    col, dir_ = _sanitize_order(order_by, order_dir)
+    sql = f"""
+        SELECT
+            nm_id, brand, title, seller_id, seller_name,
+            price_before_discount, price_after_seller_discount,
+            ui_price, rrc, updated_at
+        FROM {TABLE}
+        ORDER BY {col} {dir_}, nm_id ASC
+        LIMIT %s OFFSET %s
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit, offset))
+                return [_row_to_dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_products_page error: {e}")
+
+def list_products_page_violations(limit: int, offset: int, order_by: str = "nm_id", order_dir: str = "asc") -> List[Dict]:
+    col, dir_ = _sanitize_order(order_by, order_dir)
+    sql = f"""
+        SELECT
+            nm_id, brand, title, seller_id, seller_name,
+            price_before_discount, price_after_seller_discount,
+            ui_price, rrc, updated_at
+        FROM {TABLE}
+        WHERE ui_price IS NOT NULL AND ui_price > 0
+          AND rrc IS NOT NULL AND rrc > 0
+          AND ui_price < rrc
+        ORDER BY {col} {dir_}, nm_id ASC
+        LIMIT %s OFFSET %s
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit, offset))
+                return [_row_to_dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_products_page_violations error: {e}")
+
+def count_violations() -> int:
+    sql = f"""
+        SELECT COUNT(*)
+        FROM {TABLE}
+        WHERE ui_price IS NOT NULL AND ui_price > 0
+          AND rrc IS NOT NULL AND rrc > 0
+          AND ui_price < rrc
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                (cnt,) = cur.fetchone()
+                return int(cnt or 0)
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL count_violations error: {e}")
