@@ -345,37 +345,6 @@ def delete_admin(chat_id):
         raise RuntimeError(f"MySQL delete_admin error: {e}")
 
 # ====== Пагинация для фронтенда ======
-def list_products_page_violations(per_page: int, offset: int) -> List[Dict]:
-    sql = f"""
-        SELECT
-            nm_id,
-            brand,
-            title,
-            seller_id,
-            seller_name,
-            price_before_discount,
-            price_after_seller_discount,
-            ui_price,
-            rrc,
-            updated_at
-        FROM {TABLE}
-        WHERE ui_price IS NOT NULL AND ui_price > 0
-          AND rrc IS NOT NULL AND rrc > 0
-          AND ui_price < rrc
-        ORDER BY nm_id
-        LIMIT %s OFFSET %s
-    """
-    try:
-        conn = get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, (per_page, offset))
-                return [_row_to_dict(r) for r in cur.fetchall()]
-        finally:
-            conn.close()
-    except MySQLError as e:
-        raise RuntimeError(f"MySQL list_products_page_violations error: {e}")
-    
 def _sanitize_order(order_by: str, order_dir: str) -> Tuple[str, str]:
     # Белый список колонок для сортировки
     allowed = {
@@ -455,3 +424,35 @@ def count_violations() -> int:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_violations error: {e}")
+
+# --- Advisory lock для "полного" обновления ---
+def acquire_advisory_lock(name: str, timeout: int = 0) -> bool:
+    """
+    SELECT GET_LOCK(name, timeout).
+    timeout=0 => не блокируемся, просто пробуем взять.
+    """
+    sql = "SELECT GET_LOCK(%s, %s)"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (name, timeout))
+                (ok,) = cur.fetchone()
+                return bool(ok)
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL acquire_advisory_lock error: {e}")
+
+def release_advisory_lock(name: str) -> None:
+    sql = "SELECT RELEASE_LOCK(%s)"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (name,))
+                # результат можно игнорировать
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL release_advisory_lock error: {e}")

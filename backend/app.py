@@ -10,6 +10,7 @@ from db import (
     count_needing_refresh,
     list_sellers_with_violations,
     delete_all_products,
+    acquire_advisory_lock, release_advisory_lock
 )
 from db import count_all_rows, count_violations, count_needing_refresh
 
@@ -25,6 +26,7 @@ from openpyxl import load_workbook
 import time
 
 load_dotenv()  # загрузим .env заранее
+DB_TABLE = os.getenv("DB_TABLE", "products")
 
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "9"))
 WORK_END_HOUR   = int(os.getenv("WORK_END_HOUR", "20"))
@@ -308,91 +310,139 @@ def delete_product(nm_id: int):
 @application.post("/api/products/refresh-batch")
 def refresh_batch():
     """
-    Обновляет цены у N товаров (лимит из .env или ?limit=).
-    Берём кандидатов среди тех, кому «нужно обновление».
-    Возвращаем remaining и done, чтобы фронт мог крутить цикл до конца.
+    Обновляет цены:
+      - по умолчанию: ОДНА пачка (limit)
+      - full=1: крутит пачки ДО КОНЦА (под advisory-lock), внутри одного запроса
+      Флаги:
+        silent=1  — НЕ отправлять телеграм-уведомления по завершении
+        limit     — размер пачки (по умолчанию BATCH_REFRESH_LIMIT)
+    Возвращает JSON со счётчиками и done=true, когда больше нечего обновлять.
+    Для конкуренции:
+      - Если full=1 и лок не взят, вернёт {"locked": true}
     """
+    from db import (
+        list_nm_ids_for_refresh, count_needing_refresh,
+        acquire_advisory_lock, release_advisory_lock
+    )
+
     try:
         limit = BATCH_REFRESH_LIMIT
-        nm_ids = list_nm_ids_for_refresh(limit)
+        silent = bool(request.args.get("silent", type=int) or 0)
+        full = bool(request.args.get("full", type=int) or 0)
 
-        updated = []
-        errors = []
+        LOCK_NAME = f"{DB_TABLE}_refresh_full_lock"  # TABLE берём из db.py (env DB_TABLE)
 
-        for nm_id in nm_ids:
-            try:
-                data = fetch_wb_price(nm_id)
-                unavail = _infer_unavailable(data)
+        def do_one_batch(_limit: int):
+            nm_ids = list_nm_ids_for_refresh(_limit)
+            updated, errors = [], []
 
-                rrc_auto = calc_rrc_from_title(data.get("title"))
+            for nm_id in nm_ids:
+                try:
+                    data = fetch_wb_price(nm_id)
+                    price_before = float(data.get("price_before_discount") or 0)
+                    price_after  = float(data.get("price_after_seller_discount") or 0)
+                    # если карточка без цен — считаем недоступной и НЕ зацикливаем:
+                    if price_before <= 0 and price_after <= 0:
+                        price_before, price_after = 0.0, -1.0
 
-                if unavail:
-                    # помечаем как «проверено, но нет в наличии» → не зациклится
+                    rrc_auto = calc_rrc_from_title(data.get("title"))
+                    ui_price = calc_ui_price_from_product(price_after)
+
                     upsert_product(
                         nm_id=data["nm_id"],
                         brand=data.get("brand", "") or "",
                         title=data.get("title", "") or "",
-                        price_before=0.0,
-                        price_after=-1.0,
-                        seller_id=data.get("seller_id"),
-                        seller_name=data.get("seller_name") or None,
-                        ui_price=None,
-                    )
-                else:
-                    ui_price = calc_ui_price_from_product(
-                        float(data.get("price_after_seller_discount") or 0)
-                    )
-                    upsert_product(
-                        nm_id=data["nm_id"],
-                        brand=data.get("brand", "") or "",
-                        title=data.get("title", "") or "",
-                        price_before=float(data.get("price_before_discount") or 0),
-                        price_after=float(data.get("price_after_seller_discount") or 0),
+                        price_before=price_before,
+                        price_after=price_after,
                         seller_id=data.get("seller_id"),
                         seller_name=data.get("seller_name") or None,
                         ui_price=int(ui_price) if ui_price is not None else None,
                     )
+                    if rrc_auto is not None:
+                        set_rrc(nm_id, rrc_auto)
 
-                if rrc_auto is not None:
-                    set_rrc(data["nm_id"], rrc_auto)
+                    updated.append(nm_id)
+                except Exception as e:
+                    errors.append({"nm_id": nm_id, "error": str(e)})
 
-                updated.append(nm_id)
-            except Exception as e:
-                errors.append({"nm_id": nm_id, "error": str(e)})
+            remaining = count_needing_refresh()
+            return updated, errors, remaining
 
-        # после обновления цен — проверка нарушителей и уведомление
-        remaining = count_needing_refresh()
+        if not full:
+            # ОДНА пачка
+            updated, errors, remaining = do_one_batch(limit)
 
-        # ----- Рассылка только по окончанию полного обновления -----
-        global ALERTS_PENDING
-        if remaining == 0:
-            ALERTS_PENDING = True
-
-            if is_work_time():
+            # уведомления — только если НЕ silent и это была финальная пачка
+            if not silent and remaining == 0 and is_work_time():
                 try:
                     violators = list_sellers_with_violations()
                     for v in violators:
                         send_violation_alert(v["seller_id"], v.get("seller_name"))
-                    ALERTS_PENDING = False  # успешно отослали
                 except Exception as e:
-                    # не роняем запрос из-за телеги
                     print(f"[alerts] send error: {e}")
-        # ---------------------------------------
 
-        return jsonify({
-            "ok": True,
-            "requested": limit,
-            "selected": len(nm_ids),
-            "updated_count": len(updated),
-            "updated": updated,
-            "errors_count": len(errors),
-            "errors": errors,
-            "remaining": remaining,
-            "done": remaining == 0,
-        })
+            return jsonify({
+                "ok": True,
+                "requested": limit,
+                "selected": len(updated) + len(errors),
+                "updated_count": len(updated),
+                "updated": updated,
+                "errors_count": len(errors),
+                "errors": errors,
+                "remaining": remaining,
+                "done": remaining == 0,
+                "locked": False,
+            })
+
+        # full=1: крутим до конца под локом
+        if not acquire_advisory_lock(LOCK_NAME, timeout=0):
+            return jsonify({"ok": True, "locked": True}), 200
+
+        try:
+            total_updated = 0
+            total_errors = 0
+            last_errors = []
+            safety_loops = 0
+            MAX_LOOPS = 10000
+
+            while True:
+                safety_loops += 1
+                if safety_loops > MAX_LOOPS:
+                    break
+
+                updated, errors, remaining = do_one_batch(limit)
+                total_updated += len(updated)
+                total_errors  += len(errors)
+                last_errors = errors  # просто чтобы что-то отдать в ответе
+
+                if remaining == 0:
+                    break
+            # по завершении full-обновления — уведомления, если НЕ silent
+            if not silent and is_work_time():
+                try:
+                    violators = list_sellers_with_violations()
+                    for v in violators:
+                        send_violation_alert(v["seller_id"], v.get("seller_name"))
+                except Exception as e:
+                    print(f"[alerts] send error: {e}")
+
+            return jsonify({
+                "ok": True,
+                "mode": "full",
+                "updated_total": total_updated,
+                "errors_total": total_errors,
+                "errors_last_batch": last_errors,
+                "remaining": count_needing_refresh(),
+                "done": count_needing_refresh() == 0,
+                "locked": False,
+            })
+
+        finally:
+            release_advisory_lock(LOCK_NAME)
+
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    
+
 @application.delete("/api/products")
 def delete_all():
     """
