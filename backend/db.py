@@ -34,6 +34,10 @@ def get_conn():
     _ensure_pool()
     return _pool.get_connection()
 
+def _effective_table(table: Optional[str]) -> str:
+    """Если table не передан — используем TABLE из .env."""
+    return table if table else TABLE
+
 def _row_to_dict(row) -> Dict:
     return {
         "nm_id": row[0],
@@ -48,20 +52,14 @@ def _row_to_dict(row) -> Dict:
         "updated_at": row[9].isoformat() if row[9] else None,
     }
 
-def list_products() -> List[Dict]:
+def list_products(table: Optional[str] = None) -> List[Dict]:
+    t = _effective_table(table)
     sql = f"""
         SELECT
-            nm_id,
-            brand,
-            title,
-            seller_id,
-            seller_name,
-            price_before_discount,
-            price_after_seller_discount,
-            ui_price,
-            rrc,
-            updated_at
-        FROM {TABLE}
+            nm_id, brand, title, seller_id, seller_name,
+            price_before_discount, price_after_seller_discount,
+            ui_price, rrc, updated_at
+        FROM {t}
         ORDER BY nm_id
     """
     try:
@@ -84,9 +82,11 @@ def upsert_product(
     seller_id: Optional[int] = None,
     seller_name: Optional[str] = None,
     ui_price: Optional[int] = None,
+    table: Optional[str] = None,
 ) -> None:
+    t = _effective_table(table)
     sql = f"""
-        INSERT INTO {TABLE}
+        INSERT INTO {t}
             (nm_id, brand, title, seller_id, seller_name,
              price_before_discount, price_after_seller_discount, ui_price, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
@@ -111,8 +111,9 @@ def upsert_product(
     except MySQLError as e:
         raise RuntimeError(f"MySQL upsert_product error: {e}")
 
-def set_rrc(nm_id: int, rrc: Optional[float]) -> None:
-    sql = f"UPDATE {TABLE} SET rrc=%s, updated_at=NOW() WHERE nm_id=%s"
+def set_rrc(nm_id: int, rrc: Optional[float], table: Optional[str] = None) -> None:
+    t = _effective_table(table)
+    sql = f"UPDATE {t} SET rrc=%s, updated_at=NOW() WHERE nm_id=%s"
     try:
         conn = get_conn()
         try:
@@ -124,8 +125,9 @@ def set_rrc(nm_id: int, rrc: Optional[float]) -> None:
     except MySQLError as e:
         raise RuntimeError(f"MySQL set_rrc error: {e}")
 
-def delete_product(nm_id: int) -> None:
-    sql = f"DELETE FROM {TABLE} WHERE nm_id=%s"
+def delete_product(nm_id: int, table: Optional[str] = None) -> None:
+    t = _effective_table(table)
+    sql = f"DELETE FROM {t} WHERE nm_id=%s"
     try:
         conn = get_conn()
         try:
@@ -137,12 +139,10 @@ def delete_product(nm_id: int) -> None:
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_product error: {e}")
 
-def delete_all_products() -> int:
-    """
-    Удаляет все товары из таблицы.
-    Возвращает количество удалённых строк (может быть недоступно для некоторых драйверов).
-    """
-    sql = f"DELETE FROM {TABLE}"
+def delete_all_products(table: Optional[str] = None) -> int:
+    """Удаляет все товары из таблицы."""
+    t = _effective_table(table)
+    sql = f"DELETE FROM {t}"
     try:
         conn = get_conn()
         try:
@@ -156,6 +156,96 @@ def delete_all_products() -> int:
     except MySQLError as e:
         raise RuntimeError(f"MySQL delete_all_products error: {e}")
 
+# ====== История остатков на складе (отдельная таблица) ======
+def insert_stock_snapshot(nm_id: int, seller_id: int, stock_total: int) -> None:
+    sql = "INSERT INTO wb_stock_history (nm_id, seller_id, stock_total) VALUES (%s, %s, %s)"
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (nm_id, seller_id, stock_total))
+        conn.commit()
+    finally:
+        conn.close()
+
+# ====== Продажи по артикулу за 24 часа ======
+def sales_24h_for_nm_list(nm_ids: List[int]) -> Dict[int, int]:
+    """
+    Возвращает {nm_id: sold_last_24h} только для переданных nm_id.
+    Продажи считаем как суммарные положительные падения stock_total за последние 24 часа.
+    """
+    if not nm_ids:
+        return {}
+    # безопасно готовим плейсхолдеры
+    placeholders = ",".join(["%s"] * len(nm_ids))
+    sql = f"""
+        SELECT nm_id, stock_total, snapshot_ts
+        FROM wb_stock_history
+        WHERE nm_id IN ({placeholders})
+          AND snapshot_ts >= (NOW() - INTERVAL 24 HOUR)
+        ORDER BY nm_id, snapshot_ts
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(nm_ids))
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL sales_24h_for_nm_list error: {e}")
+
+    # rows: (nm_id, stock_total, snapshot_ts)
+    by_nm: Dict[int, List[int]] = {}
+    for nm_id, stock_total, _ts in rows:
+        by_nm.setdefault(int(nm_id), []).append(int(stock_total))
+
+    result: Dict[int, int] = {}
+    for nm_id, series in by_nm.items():
+        prev = None
+        sold = 0
+        for cur in series:
+            if prev is not None and cur < prev:
+                sold += (prev - cur)
+            prev = cur
+        result[nm_id] = sold
+    return result
+
+# ====== Продажи по селлеру за 24 часа ======
+def sales_last_24h() -> dict[int, int]:
+    """
+    Возвращает словарь {seller_id: продано за 24 часа}.
+    """
+    sql = """
+        SELECT seller_id, nm_id, stock_total, snapshot_ts
+        FROM wb_stock_history
+        WHERE snapshot_ts >= (NOW() - INTERVAL 24 HOUR)
+        ORDER BY nm_id, snapshot_ts
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    by_nm = {}
+    for seller_id, nm_id, stock_total, ts in rows:
+        by_nm.setdefault((seller_id, nm_id), []).append(stock_total)
+
+    sales = {}
+    for (seller_id, nm_id), stocks in by_nm.items():
+        prev = None
+        sold = 0
+        for cur in stocks:
+            if prev is not None and cur < prev:
+                sold += prev - cur
+            prev = cur
+        if sold > 0:
+            sales[seller_id] = sales.get(seller_id, 0) + sold
+    return sales
+
 # ====== Поддержка батч-обновления ======
 def _where_need_refresh() -> str:
     where = "(price_after_seller_discount IS NULL OR price_after_seller_discount = 0)"
@@ -163,11 +253,12 @@ def _where_need_refresh() -> str:
         where = f"({where} OR updated_at IS NULL OR updated_at < (NOW() - INTERVAL {STALE_HOURS} HOUR))"
     return where
 
-def list_nm_ids_for_refresh(limit: int) -> List[int]:
+def list_nm_ids_for_refresh(limit: int, table: Optional[str] = None) -> List[int]:
+    t = _effective_table(table)
     where = _where_need_refresh()
     sql = f"""
         SELECT nm_id
-        FROM {TABLE}
+        FROM {t}
         WHERE {where}
         ORDER BY (updated_at IS NULL) DESC, updated_at ASC, nm_id ASC
         LIMIT %s
@@ -184,9 +275,10 @@ def list_nm_ids_for_refresh(limit: int) -> List[int]:
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_nm_ids_for_refresh error: {e}")
 
-def count_needing_refresh() -> int:
+def count_needing_refresh(table: Optional[str] = None) -> int:
+    t = _effective_table(table)
     where = _where_need_refresh()
-    sql = f"SELECT COUNT(*) FROM {TABLE} WHERE {where}"
+    sql = f"SELECT COUNT(*) FROM {t} WHERE {where}"
     try:
         conn = get_conn()
         try:
@@ -199,14 +291,12 @@ def count_needing_refresh() -> int:
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_needing_refresh error: {e}")
 
-def list_nm_ids_any(limit: int, offset: int = 0) -> List[int]:
-    """
-    Любые товары, стабильный порядок nm_id ASC, с LIMIT/OFFSET.
-    Используется для принудительного полного прохода по таблице.
-    """
+def list_nm_ids_any(limit: int, offset: int = 0, table: Optional[str] = None) -> List[int]:
+    """Любые товары, стабильный порядок, с LIMIT/OFFSET (на случай полного прохода)."""
+    t = _effective_table(table)
     sql = f"""
         SELECT nm_id
-        FROM {TABLE}
+        FROM {t}
         ORDER BY nm_id ASC
         LIMIT %s OFFSET %s
     """
@@ -221,8 +311,9 @@ def list_nm_ids_any(limit: int, offset: int = 0) -> List[int]:
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_nm_ids_any error: {e}")
 
-def count_all_rows() -> int:
-    sql = f"SELECT COUNT(*) FROM {TABLE}"
+def count_all_rows(table: Optional[str] = None) -> int:
+    t = _effective_table(table)
+    sql = f"SELECT COUNT(*) FROM {t}"
     try:
         conn = get_conn()
         try:
@@ -235,15 +326,13 @@ def count_all_rows() -> int:
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_all_rows error: {e}")
 
-# ====== Для алармов: выборка нарушителей и их артикулов ======
-def list_violations_for_seller(seller_id: int) -> List[Dict]:
-    """
-    Нарушения у селлера: ui_price < rrc и оба заданы.
-    Возвращает [{'nm_id': ...}, ...]
-    """
+# ====== Для алармов ======
+def list_violations_for_seller(seller_id: int, table: Optional[str] = None) -> List[Dict]:
+    """Нарушения у селлера: ui_price < rrc."""
+    t = _effective_table(table)
     sql = f"""
         SELECT nm_id
-        FROM {TABLE}
+        FROM {t}
         WHERE seller_id = %s
           AND ui_price IS NOT NULL AND ui_price > 0
           AND rrc IS NOT NULL AND rrc > 0
@@ -261,14 +350,12 @@ def list_violations_for_seller(seller_id: int) -> List[Dict]:
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_violations_for_seller error: {e}")
 
-def list_sellers_with_violations() -> List[Dict]:
-    """
-    Селлеры, у которых есть хотя бы одно нарушение.
-    Возвращает [{'seller_id': ..., 'seller_name': ..., 'violations': N}, ...]
-    """
+def list_sellers_with_violations(table: Optional[str] = None) -> List[Dict]:
+    """Селлеры, у которых есть хотя бы одно нарушение."""
+    t = _effective_table(table)
     sql = f"""
         SELECT seller_id, MAX(seller_name) as seller_name, COUNT(*) as cnt
-        FROM {TABLE}
+        FROM {t}
         WHERE ui_price IS NOT NULL AND ui_price > 0
           AND rrc IS NOT NULL AND rrc > 0
           AND ui_price < rrc
@@ -290,8 +377,9 @@ def list_sellers_with_violations() -> List[Dict]:
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_sellers_with_violations error: {e}")
 
-def get_seller_name(seller_id: int) -> Optional[str]:
-    sql = f"SELECT MAX(seller_name) FROM {TABLE} WHERE seller_id=%s"
+def get_seller_name(seller_id: int, table: Optional[str] = None) -> Optional[str]:
+    t = _effective_table(table)
+    sql = f"SELECT MAX(seller_name) FROM {t} WHERE seller_id=%s"
     try:
         conn = get_conn()
         try:
@@ -303,8 +391,8 @@ def get_seller_name(seller_id: int) -> Optional[str]:
             conn.close()
     except MySQLError as e:
         raise RuntimeError(f"MySQL get_seller_name error: {e}")
-    
-# ====== Telegram admins ======
+
+# ====== Telegram admins (отдельная таблица, без параметра table) ======
 def list_admin_chat_ids():
     sql = "SELECT chat_id FROM tg_admins"
     try:
@@ -346,7 +434,6 @@ def delete_admin(chat_id):
 
 # ====== Пагинация для фронтенда ======
 def _sanitize_order(order_by: str, order_dir: str) -> Tuple[str, str]:
-    # Белый список колонок для сортировки
     allowed = {
         "nm_id": "nm_id",
         "seller_name": "seller_name",
@@ -358,14 +445,15 @@ def _sanitize_order(order_by: str, order_dir: str) -> Tuple[str, str]:
     dir_ = "DESC" if (order_dir or "").lower() == "desc" else "ASC"
     return col, dir_
 
-def list_products_page(limit: int, offset: int, order_by: str = "nm_id", order_dir: str = "asc") -> List[Dict]:
+def list_products_page(limit: int, offset: int, order_by: str = "nm_id", order_dir: str = "asc", table: Optional[str] = None) -> List[Dict]:
+    t = _effective_table(table)
     col, dir_ = _sanitize_order(order_by, order_dir)
     sql = f"""
         SELECT
             nm_id, brand, title, seller_id, seller_name,
             price_before_discount, price_after_seller_discount,
             ui_price, rrc, updated_at
-        FROM {TABLE}
+        FROM {t}
         ORDER BY {col} {dir_}, nm_id ASC
         LIMIT %s OFFSET %s
     """
@@ -380,17 +468,18 @@ def list_products_page(limit: int, offset: int, order_by: str = "nm_id", order_d
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_products_page error: {e}")
 
-def list_products_page_violations(limit: int, offset: int, order_by: str = "nm_id", order_dir: str = "asc") -> List[Dict]:
+def list_products_page_violations(limit: int, offset: int, order_by: str = "nm_id", order_dir: str = "asc", table: Optional[str] = None) -> List[Dict]:
+    t = _effective_table(table)
     col, dir_ = _sanitize_order(order_by, order_dir)
     sql = f"""
         SELECT
             nm_id, brand, title, seller_id, seller_name,
             price_before_discount, price_after_seller_discount,
             ui_price, rrc, updated_at
-        FROM {TABLE}
-        WHERE ui_price IS NOT NULL AND ui_price > 0
-          AND rrc IS NOT NULL AND rrc > 0
-          AND ui_price < rrc
+        FROM {t}
+        WHERE rrc IS NOT NULL AND rrc > 0
+          AND ((ui_price IS NOT NULL AND ui_price > 0 AND ui_price < rrc)
+          OR (price_after_seller_discount IS NOT NULL AND price_after_seller_discount > 0 AND price_after_seller_discount < rrc))
         ORDER BY {col} {dir_}, nm_id ASC
         LIMIT %s OFFSET %s
     """
@@ -405,13 +494,14 @@ def list_products_page_violations(limit: int, offset: int, order_by: str = "nm_i
     except MySQLError as e:
         raise RuntimeError(f"MySQL list_products_page_violations error: {e}")
 
-def count_violations() -> int:
+def count_violations(table: Optional[str] = None) -> int:
+    t = _effective_table(table)
     sql = f"""
         SELECT COUNT(*)
-        FROM {TABLE}
-        WHERE ui_price IS NOT NULL AND ui_price > 0
-          AND rrc IS NOT NULL AND rrc > 0
-          AND ui_price < rrc
+        FROM {t}
+        WHERE rrc IS NOT NULL AND rrc > 0
+          AND ((ui_price IS NOT NULL AND ui_price > 0 AND ui_price < rrc)
+          OR (price_after_seller_discount IS NOT NULL AND price_after_seller_discount > 0 AND price_after_seller_discount < rrc))
     """
     try:
         conn = get_conn()
@@ -425,12 +515,8 @@ def count_violations() -> int:
     except MySQLError as e:
         raise RuntimeError(f"MySQL count_violations error: {e}")
 
-# --- Advisory lock для "полного" обновления ---
+# --- Advisory lock (имя задаётся снаружи, завязано на table) ---
 def acquire_advisory_lock(name: str, timeout: int = 0) -> bool:
-    """
-    SELECT GET_LOCK(name, timeout).
-    timeout=0 => не блокируемся, просто пробуем взять.
-    """
     sql = "SELECT GET_LOCK(%s, %s)"
     try:
         conn = get_conn()
@@ -451,7 +537,6 @@ def release_advisory_lock(name: str) -> None:
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, (name,))
-                # результат можно игнорировать
         finally:
             conn.close()
     except MySQLError as e:

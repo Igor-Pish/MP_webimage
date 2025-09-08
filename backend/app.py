@@ -10,12 +10,13 @@ from db import (
     count_needing_refresh,
     list_sellers_with_violations,
     delete_all_products,
-    acquire_advisory_lock, release_advisory_lock
+    acquire_advisory_lock, release_advisory_lock,
+    count_all_rows, count_violations,
+    list_products_page, list_products_page_violations,
+    list_violations_for_seller,
+    sales_24h_for_nm_list
 )
-from db import count_all_rows, count_violations, count_needing_refresh
-
-from utils import calc_rrc_from_title, _parse_nm_id, _parse_price_like, _detect_columns
-
+from utils import calc_rrc_from_title, _parse_nm_id, _parse_price_like, _detect_columns, iter_ozon_csv_rows
 from telegram_client import send_violation_alert
 
 import os
@@ -26,48 +27,51 @@ from openpyxl import load_workbook
 import time
 
 load_dotenv()  # загрузим .env заранее
-DB_TABLE = os.getenv("DB_TABLE", "products")
+DB_TABLE_DEFAULT = os.getenv("DB_TABLE", "products")
+DB_TABLE_OZON = os.getenv("DB_TABLE_OZON", "products_ozon")
 
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "9"))
 WORK_END_HOUR   = int(os.getenv("WORK_END_HOUR", "20"))
 WORK_TZ_OFFSET  = int(os.getenv("WORK_TZ_OFFSET", "0"))  # смещение в часах от UTC
-ALERTS_PENDING = False
 
-def now_local_hour() -> int:
-    """
-    Текущее «локальное» время = системное + смещение WORK_TZ_OFFSET, в часах 0..23.
-    """
-    t = time.time() + WORK_TZ_OFFSET * 3600
-    return time.gmtime(t).tm_hour
+# ====== Фиолетовая цена (UI) ======
+UI_WALLET_PERCENT = float(os.getenv("UI_WALLET_PERCENT", "0"))
+UI_ROUND_THRESHOLD = float(os.getenv("UI_ROUND_THRESHOLD", "0"))
+UI_ROUND_STEP = float(os.getenv("UI_ROUND_STEP", "1"))
 
-def is_work_time() -> bool:
-    h = now_local_hour()
-    # интервал [start, end)
-    if WORK_START_HOUR <= WORK_END_HOUR:
-        return WORK_START_HOUR <= h < WORK_END_HOUR
-    # если вдруг задали «через полночь»
-    return h >= WORK_START_HOUR or h < WORK_END_HOUR
-
-# ====== Параметры для расчёта фиолетовой цены ======
-UI_WALLET_PERCENT = float(os.getenv("UI_WALLET_PERCENT", "0"))        # 0.02 => 2%
-UI_ROUND_THRESHOLD = float(os.getenv("UI_ROUND_THRESHOLD", "0"))      # порог округления (0 = выкл)
-UI_ROUND_STEP = float(os.getenv("UI_ROUND_STEP", "1"))                # шаг округления (>=1)
-
-# ====== Параметры пакетного обновления ======
+# ====== Пакетное обновление ======
 BATCH_REFRESH_LIMIT = int(os.getenv("BATCH_REFRESH_LIMIT", "20"))
 
 # ====== Загрузка файлов (xlsx) ======
 UPLOAD_ALLOWED_EXT = {".xlsx"}
 
+# ====== Разрешённые таблицы ======
+ALLOWED_TABLES = {DB_TABLE_DEFAULT, DB_TABLE_OZON}
+
+def resolve_table() -> str:
+    """
+    Определяем целевую таблицу из query-параметра ?table=...
+    По умолчанию — DB_TABLE_DEFAULT.
+    Белый список: products, products_ozon (можно расширить переменными окружения).
+    """
+    t = (request.args.get("table") or "").strip()
+    if t in ALLOWED_TABLES:
+        return t
+    # допускаем «чистые» имена, но всё равно проверяем whitelist — безопасность SQL
+    return DB_TABLE_DEFAULT
+
+def now_local_hour() -> int:
+    t = time.time() + WORK_TZ_OFFSET * 3600
+    return time.gmtime(t).tm_hour
+
+def is_work_time() -> bool:
+    h = now_local_hour()
+    if WORK_START_HOUR <= WORK_END_HOUR:
+        return WORK_START_HOUR <= h < WORK_END_HOUR
+    return h >= WORK_START_HOUR or h < WORK_END_HOUR
 
 def calc_ui_price_from_product(base_price: Optional[float]) -> Optional[int]:
-    """
-    Фиолетовая цена (UI) от price_after_seller_discount (в рублях, целое):
-      raw = base * (1 - p)
-      если base >= threshold: ui = floor(raw / step) * step
-      иначе ui = raw
-    Возвращаем целое (рубли).
-    """
+    """Считаем UI-цену (рубли, целое) по заданным правилам округления."""
     if base_price is None:
         return None
     try:
@@ -88,17 +92,32 @@ def calc_ui_price_from_product(base_price: Optional[float]) -> Optional[int]:
         return None
 
 def _infer_unavailable(data: dict) -> bool:
-    """
-    Эвристика: считаем товар недоступным если:
-    - явный флаг из парсера (in_stock/available == False), или
-    - нет/ноль цены after_seller_discount и before_discount.
-    """
+    """Эвристика недоступности товара: нет цен и/или флаг in_stock/available=false."""
     for k in ("in_stock", "available"):
         if k in data and data.get(k) is False:
             return True
     pa = float(data.get("price_after_seller_discount") or 0)
     pb = float(data.get("price_before_discount") or 0)
     return (pa <= 0 and pb <= 0)
+
+def _read_html_from_request() -> str:
+    # 1) multipart: поля 'html' или 'file'
+    f = request.files.get("html") or request.files.get("file")
+    data = f.read() if f else (request.get_data() or b"")
+    # 2) поддержка gzip
+    if (request.headers.get("Content-Encoding") or "").lower() == "gzip":
+        try:
+            import gzip
+            data = gzip.decompress(data)
+        except Exception:
+            pass
+    # 3) декодирование
+    for enc in ("utf-8", "cp1251", "latin-1"):
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="ignore")
 
 application = Flask(__name__)
 CORS(
@@ -115,22 +134,24 @@ def health():
 def list_products():
     """
     Пагинация:
-      ?limit=100&offset=0&only_violations=0|1&sort=nm_id|seller_name|price_after_seller_discount&dir=asc|desc
+      ?limit=100&offset=0&only_violations=0|1&sort=nm_id|seller_name|price_after_seller_discount|updated_at|rrc
+      &dir=asc|desc
+      &table=products|products_ozon
     """
     try:
+        table = resolve_table()
+
         limit = request.args.get("limit", default=100, type=int)
         offset = request.args.get("offset", default=0, type=int)
         only_viol = request.args.get("only_violations", default=0, type=int)
         sort = (request.args.get("sort") or "nm_id").strip()
         dir_ = (request.args.get("dir") or "asc").strip().lower()
 
-        # guardrails
         if limit < 1: limit = 100
         if limit > 500: limit = 500
         if offset < 0: offset = 0
         if dir_ not in ("asc", "desc"): dir_ = "asc"
 
-        # белый список сортировки: ключ -> SQL-колонка
         sort_map = {
             "nm_id": "nm_id",
             "seller_name": "seller_name",
@@ -140,19 +161,21 @@ def list_products():
         }
         sort_col = sort_map.get(sort, "nm_id")
 
-        from db import (
-            list_products_page,
-            list_products_page_violations,
-            count_all_rows,
-            count_violations,
-        )
-
         if only_viol:
-            total_rows = count_violations()
-            items = list_products_page_violations(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_)
+            total_rows = count_violations(table=table)
+            items = list_products_page_violations(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_, table=table)
         else:
-            total_rows = count_all_rows()
-            items = list_products_page(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_)
+            total_rows = count_all_rows(table=table)
+            items = list_products_page(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_, table=table)
+        
+        nm_ids = [int(it["nm_id"]) for it in items]  # текущая страница
+        try:
+            sold_map = sales_24h_for_nm_list(nm_ids)
+        except Exception:
+            sold_map = {}
+
+        for it in items:
+            it["sold_24h"] = int(sold_map.get(int(it["nm_id"]), 0))
 
         page = (offset // limit) + 1
         total_pages = (total_rows + limit - 1) // limit
@@ -173,6 +196,7 @@ def list_products():
 
 @application.post("/api/products")
 def add_product():
+    table = resolve_table()
     body = request.get_json(silent=True) or {}
     nm_id = body.get("nm_id")
     try:
@@ -182,11 +206,9 @@ def add_product():
     try:
         data = fetch_wb_price(nm_id)
         unavail = _infer_unavailable(data)
-
         rrc_auto = calc_rrc_from_title(data.get("title"))
 
         if unavail:
-            # помечаем как «проверено, но нет в наличии» → не зациклится
             upsert_product(
                 nm_id=data["nm_id"],
                 brand=data.get("brand", "") or "",
@@ -196,11 +218,10 @@ def add_product():
                 seller_id=data.get("seller_id"),
                 seller_name=data.get("seller_name") or None,
                 ui_price=None,
+                table=table,
             )
         else:
-            ui_price = calc_ui_price_from_product(
-                float(data.get("price_after_seller_discount") or 0)
-            )
+            ui_price = calc_ui_price_from_product(float(data.get("price_after_seller_discount") or 0))
             upsert_product(
                 nm_id=data["nm_id"],
                 brand=data.get("brand", "") or "",
@@ -210,10 +231,11 @@ def add_product():
                 seller_id=data.get("seller_id"),
                 seller_name=data.get("seller_name") or None,
                 ui_price=int(ui_price) if ui_price is not None else None,
+                table=table,
             )
 
         if rrc_auto is not None:
-            set_rrc(data["nm_id"], rrc_auto)
+            set_rrc(data["nm_id"], rrc_auto, table=table)
 
         return jsonify({"ok": True, "item": data})
     except Exception as e:
@@ -221,14 +243,13 @@ def add_product():
 
 @application.post("/api/products/<int:nm_id>/refresh")
 def refresh_product(nm_id: int):
+    table = resolve_table()
     try:
         data = fetch_wb_price(nm_id)
         unavail = _infer_unavailable(data)
-
         rrc_auto = calc_rrc_from_title(data.get("title"))
 
         if unavail:
-            # помечаем как «проверено, но нет в наличии» → не зациклится
             upsert_product(
                 nm_id=data["nm_id"],
                 brand=data.get("brand", "") or "",
@@ -238,11 +259,10 @@ def refresh_product(nm_id: int):
                 seller_id=data.get("seller_id"),
                 seller_name=data.get("seller_name") or None,
                 ui_price=None,
+                table=table,
             )
         else:
-            ui_price = calc_ui_price_from_product(
-                float(data.get("price_after_seller_discount") or 0)
-            )
+            ui_price = calc_ui_price_from_product(float(data.get("price_after_seller_discount") or 0))
             upsert_product(
                 nm_id=data["nm_id"],
                 brand=data.get("brand", "") or "",
@@ -252,17 +272,19 @@ def refresh_product(nm_id: int):
                 seller_id=data.get("seller_id"),
                 seller_name=data.get("seller_name") or None,
                 ui_price=int(ui_price) if ui_price is not None else None,
+                table=table,
             )
 
         if rrc_auto is not None:
-            set_rrc(data["nm_id"], rrc_auto)
-        
+            set_rrc(data["nm_id"], rrc_auto, table=table)
+
         return jsonify({"ok": True, "item": data})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @application.post("/api/products/<int:nm_id>/rrc")
 def post_rrc(nm_id: int):
+    table = resolve_table()
     body = request.get_json(silent=True) or {}
     rrc = body.get("rrc", None)
 
@@ -275,13 +297,14 @@ def post_rrc(nm_id: int):
             return jsonify({"ok": False, "error": "rrc должно быть числом"}), 400
 
     try:
-        set_rrc(nm_id, val)
+        set_rrc(nm_id, val, table=table)
         return jsonify({"ok": True, "nm_id": nm_id, "rrc": val})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @application.route("/api/products/<int:nm_id>/rrc", methods=["PATCH"])
 def patch_rrc(nm_id: int):
+    table = resolve_table()
     body = request.get_json(silent=True) or {}
     rrc = body.get("rrc", None)
 
@@ -294,15 +317,16 @@ def patch_rrc(nm_id: int):
             return jsonify({"ok": False, "error": "rrc должно быть числом"}), 400
 
     try:
-        set_rrc(nm_id, val)
+        set_rrc(nm_id, val, table=table)
         return jsonify({"ok": True, "nm_id": nm_id, "rrc": val})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @application.delete("/api/products/<int:nm_id>")
 def delete_product(nm_id: int):
+    table = resolve_table()
     try:
-        db_delete(nm_id)
+        db_delete(nm_id, table=table)
         return jsonify({"ok": True, "nm_id": nm_id})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -310,30 +334,19 @@ def delete_product(nm_id: int):
 @application.post("/api/products/refresh-batch")
 def refresh_batch():
     """
-    Обновляет цены:
-      - по умолчанию: ОДНА пачка (limit)
-      - full=1: крутит пачки ДО КОНЦА (под advisory-lock), внутри одного запроса
-      Флаги:
-        silent=1  — НЕ отправлять телеграм-уведомления по завершении
-        limit     — размер пачки (по умолчанию BATCH_REFRESH_LIMIT)
-    Возвращает JSON со счётчиками и done=true, когда больше нечего обновлять.
-    Для конкуренции:
-      - Если full=1 и лок не взят, вернёт {"locked": true}
+    Пакетное обновление.
+    Понимает ?table=products|products_ozon, silent=1, full=1, limit=...
     """
-    from db import (
-        list_nm_ids_for_refresh, count_needing_refresh,
-        acquire_advisory_lock, release_advisory_lock
-    )
-
     try:
-        limit = BATCH_REFRESH_LIMIT
+        table = resolve_table()
+        limit = int(request.args.get("limit", BATCH_REFRESH_LIMIT))
         silent = bool(request.args.get("silent", type=int) or 0)
         full = bool(request.args.get("full", type=int) or 0)
 
-        LOCK_NAME = f"{DB_TABLE}_refresh_full_lock"  # TABLE берём из db.py (env DB_TABLE)
+        LOCK_NAME = f"{table}_refresh_full_lock"
 
         def do_one_batch(_limit: int):
-            nm_ids = list_nm_ids_for_refresh(_limit)
+            nm_ids = list_nm_ids_for_refresh(_limit, table=table)
             updated, errors = [], []
 
             for nm_id in nm_ids:
@@ -341,7 +354,6 @@ def refresh_batch():
                     data = fetch_wb_price(nm_id)
                     price_before = float(data.get("price_before_discount") or 0)
                     price_after  = float(data.get("price_after_seller_discount") or 0)
-                    # если карточка без цен — считаем недоступной и НЕ зацикливаем:
                     if price_before <= 0 and price_after <= 0:
                         price_before, price_after = 0.0, -1.0
 
@@ -357,25 +369,23 @@ def refresh_batch():
                         seller_id=data.get("seller_id"),
                         seller_name=data.get("seller_name") or None,
                         ui_price=int(ui_price) if ui_price is not None else None,
+                        table=table,
                     )
                     if rrc_auto is not None:
-                        set_rrc(nm_id, rrc_auto)
+                        set_rrc(nm_id, rrc_auto, table=table)
 
                     updated.append(nm_id)
                 except Exception as e:
                     errors.append({"nm_id": nm_id, "error": str(e)})
 
-            remaining = count_needing_refresh()
+            remaining = count_needing_refresh(table=table)
             return updated, errors, remaining
 
         if not full:
-            # ОДНА пачка
             updated, errors, remaining = do_one_batch(limit)
-
-            # уведомления — только если НЕ silent и это была финальная пачка
             if not silent and remaining == 0 and is_work_time():
                 try:
-                    violators = list_sellers_with_violations()
+                    violators = list_sellers_with_violations(table=table)
                     for v in violators:
                         send_violation_alert(v["seller_id"], v.get("seller_name"))
                 except Exception as e:
@@ -394,7 +404,7 @@ def refresh_batch():
                 "locked": False,
             })
 
-        # full=1: крутим до конца под локом
+        # full=1 под advisory-lock
         if not acquire_advisory_lock(LOCK_NAME, timeout=0):
             return jsonify({"ok": True, "locked": True}), 200
 
@@ -413,14 +423,14 @@ def refresh_batch():
                 updated, errors, remaining = do_one_batch(limit)
                 total_updated += len(updated)
                 total_errors  += len(errors)
-                last_errors = errors  # просто чтобы что-то отдать в ответе
+                last_errors = errors
 
                 if remaining == 0:
                     break
-            # по завершении full-обновления — уведомления, если НЕ silent
+
             if not silent and is_work_time():
                 try:
-                    violators = list_sellers_with_violations()
+                    violators = list_sellers_with_violations(table=table)
                     for v in violators:
                         send_violation_alert(v["seller_id"], v.get("seller_name"))
                 except Exception as e:
@@ -432,11 +442,10 @@ def refresh_batch():
                 "updated_total": total_updated,
                 "errors_total": total_errors,
                 "errors_last_batch": last_errors,
-                "remaining": count_needing_refresh(),
-                "done": count_needing_refresh() == 0,
+                "remaining": count_needing_refresh(table=table),
+                "done": count_needing_refresh(table=table) == 0,
                 "locked": False,
             })
-
         finally:
             release_advisory_lock(LOCK_NAME)
 
@@ -445,11 +454,10 @@ def refresh_batch():
 
 @application.delete("/api/products")
 def delete_all():
-    """
-    Удаляет все товары из БД.
-    """
+    """Удаляет все товары из выбранной таблицы."""
     try:
-        removed = delete_all_products()
+        table = resolve_table()
+        removed = delete_all_products(table=table)
         return jsonify({"ok": True, "removed": removed})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -457,14 +465,11 @@ def delete_all():
 @application.post("/api/upload-xlsx")
 def upload_xlsx():
     """
-    Импорт XLSX c «умным» поиском колонок.
-    - Сначала ищем по заголовку: Артикул / РРЦ.
-    - Если не нашли, определяем эвристически:
-        * Артикул: колонка с макс. числом «похожих на nm_id»
-        * РРЦ: колонка, где большинство значений ∈ {1300, 1500} (или просто числовая колонка)
-    - Если РРЦ не нашли — импортируем только nm_id (РРЦ остаётся как есть).
+    Импорт XLSX в выбранную таблицу (?table=...).
+    Колонки nm/rrc определяются автоматически, как раньше.
     """
     try:
+        table = resolve_table()
         file = request.files.get("file")
         if not file:
             return jsonify({"ok": False, "error": "Файл не передан"}), 400
@@ -475,7 +480,6 @@ def upload_xlsx():
         nm_col_arg = request.args.get("nm_col", type=int)
         rrc_col_arg = request.args.get("rrc_col", type=int)
 
-        # Автоопределение колонок
         if nm_col_arg is not None or rrc_col_arg is not None:
             idx_nm, idx_rrc = nm_col_arg, rrc_col_arg
         else:
@@ -486,7 +490,6 @@ def upload_xlsx():
         skipped = 0
         errors = 0
 
-        # Перебираем строки
         for row in ws.iter_rows(min_row=2, values_only=True):
             total += 1
 
@@ -502,11 +505,9 @@ def upload_xlsx():
             if idx_rrc is not None and idx_rrc < len(row):
                 rrc_parsed = _parse_price_like(row[idx_rrc])
                 if rrc_parsed is not None:
-                    rrc_val = float(int(round(rrc_parsed)))  # до целых рублей
+                    rrc_val = float(int(round(rrc_parsed)))
 
             try:
-                # создаём/обновляем строку с нулевыми ценами (ui_price=None),
-                # реальную цену подтянет батч-обновление
                 upsert_product(
                     nm_id=nm_val,
                     brand="",
@@ -516,9 +517,10 @@ def upload_xlsx():
                     seller_id=None,
                     seller_name=None,
                     ui_price=None,
+                    table=table,
                 )
                 if rrc_val is not None:
-                    set_rrc(nm_val, rrc_val)
+                    set_rrc(nm_val, rrc_val, table=table)
                 affected += 1
             except Exception:
                 errors += 1
@@ -540,30 +542,68 @@ def upload_xlsx():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@application.post("/api/upload-ozon-csv")
+def upload_ozon_csv():
+    # какую таблицу заполняем: по умолчанию Ozon
+    table = DB_TABLE_OZON
+
+    file = request.files.get("file") or request.files.get("csv")
+    if not file:
+        return jsonify({"ok": False, "error": "Файл не передан"}), 400
+
+    data_bytes = file.read()
+    total = affected = errors = 0
+
+    for rec in iter_ozon_csv_rows(data_bytes):
+        total += 1
+        try:
+            # Записываем всё, что пришло из CSV. Продавца тоже сохраняем.
+            upsert_product(
+                nm_id=rec["nm_id"],
+                brand="",                                     # в CSV бренда нет — оставляем пусто
+                title=rec.get("title") or "",
+                price_before=rec.get("price_before") or 0.0,
+                price_after=rec.get("price_after") or 0.0,
+                seller_id=rec.get("seller_id"),
+                seller_name=rec.get("seller_name"),
+                ui_price=None,
+                table=table,
+            )
+            # Если захочешь авто-РРЦ — раскомментируй:
+            rrc_auto = calc_rrc_from_title(rec.get("title"))
+            if rrc_auto is not None: set_rrc(rec["nm_id"], rrc_auto, table=table)
+
+            affected += 1
+        except Exception:
+            errors += 1
+
+    return jsonify({
+        "ok": True,
+        "source": "csv",
+        "total": total,
+        "affected": affected,
+        "errors_count": errors,
+        "table": table,
+    })
 
 @application.get("/api/sellers/<int:seller_id>/violations")
 def seller_violations(seller_id: int):
-    """
-    Возвращает список артикулов с нарушением для селлера.
-    Критерий: ui_price < rrc (оба не NULL/0).
-    Формат: { items: [ { nm_id }, ... ] }
-    """
+    """Список nm_id с нарушением для селлера в выбранной таблице (?table=...)."""
     try:
-        from db import list_violations_for_seller
-        rows = list_violations_for_seller(seller_id)
+        table = resolve_table()
+        rows = list_violations_for_seller(seller_id, table=table)
         return jsonify({"items": rows})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @application.get("/api/stats")
 def stats():
-    """
-    Сводка для UI: всего строк, нарушителей, сколько ещё нуждается в обновлении.
-    """
+    """Сводка по выбранной таблице (?table=...)."""
     try:
-        total_rows = count_all_rows()
-        viol_count = count_violations()
-        remaining = count_needing_refresh()
+        table = resolve_table()
+        total_rows = count_all_rows(table=table)
+        viol_count = count_violations(table=table)
+        remaining = count_needing_refresh(table=table)
         return jsonify({
             "ok": True,
             "total_rows": total_rows,

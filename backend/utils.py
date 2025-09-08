@@ -1,6 +1,7 @@
 import re
 from typing import Optional
 from openpyxl import load_workbook
+import csv, io
 
 _UNITS_RE = re.compile(
     r"""^\s*
@@ -271,3 +272,78 @@ def _detect_columns(ws, sample_rows=200):
             idx_rrc = int(max(range(ncols), key=lambda i: rrc_votes[i]))
 
     return idx_nm, idx_rrc
+
+def _norm(s):
+    return (str(s).strip() if s is not None else "")
+
+def iter_ozon_csv_rows(file_bytes: bytes):
+    """
+    Потоковый парсер CSV (оба формата).
+    Находит ключевые колонки по русским заголовкам.
+    Возвращает словари:
+      { 'nm_id': int, 'title': str,
+        'price_after': float|None, 'price_before': float|None,
+        'seller_id': int|None, 'seller_name': str|None }
+    """
+    # 1) определим кодировку
+    for enc in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except Exception:
+            continue
+    else:
+        text = file_bytes.decode("utf-8", errors="ignore")
+
+    # 2) читаем CSV (разделитель в примерах — запятая)
+    reader = csv.DictReader(io.StringIO(text), delimiter=",")
+
+    # 3) нормализуем имена колонок (в нижний регистр, убираем лишние пробелы)
+    def norm_header(h): 
+        return _norm(h).lower()
+
+    headers = {norm_header(h): h for h in reader.fieldnames or []}
+
+    # Набор возможных ключей
+    key_nm      = next((headers[k] for k in headers if "артикул" in k), None)
+    key_title   = next((headers[k] for k in headers if "название" in k), None)
+    key_price   = next((headers[k] for k in headers if k == "цена"), None)
+    key_price_sp= next((headers[k] for k in headers if "спец" in k and "цена" in k), None)
+    key_old     = next((headers[k] for k in headers if "старая цена" in k), None)
+    key_seller  = next((headers[k] for k in headers if "продавец" == k), None)
+    key_seller_id = next((headers[k] for k in headers if "id продавца" == k), None)
+
+    for row in reader:
+        nm_raw = row.get(key_nm) if key_nm else None
+        nm_id = _parse_nm_id(nm_raw)
+        if not nm_id:
+            continue  # пропускаем странные строки/итоги
+
+        title = _norm(row.get(key_title)) if key_title else ""
+
+        # price_after: сначала "Спец. цена", затем "Цена"
+        p_after = None
+        if key_price_sp:
+            p_after = _parse_price_like(row.get(key_price_sp))
+        if p_after is None and key_price:
+            p_after = _parse_price_like(row.get(key_price))
+
+        # price_before: "Старая цена" (если нет — None/0)
+        p_before = _parse_price_like(row.get(key_old)) if key_old else None
+
+        # продавец (во втором формате есть, в первом — нет)
+        seller_name = _norm(row.get(key_seller)) if key_seller else None
+        sid_raw = row.get(key_seller_id) if key_seller_id else None
+        try:
+            seller_id = int(str(sid_raw).strip()) if sid_raw not in (None, "", "nan") else None
+        except Exception:
+            seller_id = None
+
+        yield {
+            "nm_id": nm_id,
+            "title": title,
+            "price_after": float(p_after) if p_after is not None else None,
+            "price_before": float(p_before) if p_before is not None else None,
+            "seller_id": seller_id,
+            "seller_name": (seller_name or None),
+        }

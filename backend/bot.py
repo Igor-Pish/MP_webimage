@@ -273,7 +273,7 @@ async def on_startup(dp_: Dispatcher):
     )
     scheduler.add_listener(_job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_MISSED | EVENT_JOB_ERROR)
 
-    # Ежедневная сводка
+    # Ежедневная сводка нарушителей
     scheduler.add_job(
         daily_summary_job,
         trigger="cron",
@@ -283,12 +283,13 @@ async def on_startup(dp_: Dispatcher):
         id="daily_summary",
         replace_existing=True,
     )
-
+    # Ежедневное обновление всех товаров в «тихом» режиме (без пушей)
     scheduler.add_job(
         daily_silent_refresh,
-        trigger="cron",
-        day_of_week="mon-fri",   # или "mon-sun"
-        hour=9, minute=0,       # во сколько запускать
+        trigger="interval",
+        hours=6,
+        id="silent_refresh",
+        replace_existing=True,
     )
 
     scheduler.start()

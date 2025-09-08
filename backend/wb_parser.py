@@ -1,4 +1,5 @@
 import requests
+from db import insert_stock_snapshot
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -37,6 +38,12 @@ def fetch_wb_price(nm_id: int) -> dict:
     # пробегаемся по всем размерам и берём первый валидный прайс
     price_before_discount = None
     price_after_seller_discount = None
+
+    # обновляем стоки, для истории продаж
+    try:
+        insert_stock_snapshot(nm_id, seller_id, product.get("totalQuantity"))
+    except Exception as e:
+        raise ValueError(f"Ошибка при сохранении стока для nm_id={nm_id}: {e}")
 
     for s in product.get("sizes", []) or []:
         pr = (s or {}).get("price") or {}

@@ -1,7 +1,7 @@
 import os
 import requests
 
-from db import list_admin_chat_ids
+from db import list_admin_chat_ids, sales_last_24h
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
@@ -87,12 +87,15 @@ def send_daily_summary(violators, link_to_ui="https://mp.web-image.su"):
         text = "На сейчас нарушителей нет ✅"
     else:
         lines = ["<b>Ежедневная сводка по нарушителям</b>", ""]
+        sales = sales_last_24h()
         for v in violators:
+            v["sold_last_24h"] = sales.get(v["seller_id"], 0)
             sid = v.get("seller_id")
             name = v.get("seller_name") or f"ID {sid}"
             cnt = v.get("violations", 0)
             link = f"https://www.wildberries.ru/seller/{sid}"
             lines.append(f"— <a href=\"{link}\">{name}</a>: {cnt}")
+            lines.append(f"  Продано за сутки: {v['sold_last_24h']}")
         if link_to_ui:
             lines += ["", f"<a href=\"{link_to_ui}\">Открыть панель</a>"]
         text = "\n".join(lines)
