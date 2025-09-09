@@ -14,7 +14,8 @@ from db import (
     count_all_rows, count_violations,
     list_products_page, list_products_page_violations,
     list_violations_for_seller,
-    sales_24h_for_nm_list
+    sales_24h_for_nm_list,
+    set_rrc_all,
 )
 from utils import calc_rrc_from_title, _parse_nm_id, _parse_price_like, _detect_columns, iter_ozon_csv_rows
 from telegram_client import send_violation_alert
@@ -317,6 +318,25 @@ def patch_rrc(nm_id: int):
     try:
         set_rrc(nm_id, val, table=table)
         return jsonify({"ok": True, "nm_id": nm_id, "rrc": val})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@application.post("/api/rrc/set-all")
+def rrc_set_all():
+    try:
+        table = resolve_table()  # текущая таблица (WB или Ozon)
+        body = request.get_json(silent=True) or {}
+        rrc = body.get("rrc", None)
+
+        try:
+            val = float(rrc)
+        except Exception:
+            return jsonify({"ok": False, "error": "rrc должно быть числом"}), 400
+        if val <= 0:
+            return jsonify({"ok": False, "error": "rrc должно быть > 0"}), 400
+
+        affected = set_rrc_all(val, table=table)
+        return jsonify({"ok": True, "table": table, "rrc": val, "affected": affected})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

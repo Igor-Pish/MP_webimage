@@ -128,6 +128,25 @@ def set_rrc(nm_id: int, rrc: Optional[float], table: Optional[str] = None) -> No
     except MySQLError as e:
         raise RuntimeError(f"MySQL set_rrc error: {e}")
 
+def set_rrc_all(rrc: float, table: Optional[str] = None) -> int:
+    """
+    Массово проставляет RRC = rrc всем строкам таблицы.
+    Возвращает количество затронутых строк (по данным драйвера).
+    """
+    tbl = table or TABLE
+    sql = f"UPDATE {tbl} SET rrc=%s, updated_at=NOW()"
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (rrc,))
+            conn.commit()
+            return cur.rowcount or 0
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL set_rrc_all error: {e}")
+
 def delete_product(nm_id: int, table: Optional[str] = None) -> None:
     t = _effective_table(table)
     sql = f"DELETE FROM {t} WHERE nm_id=%s"
