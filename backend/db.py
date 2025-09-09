@@ -50,6 +50,7 @@ def _row_to_dict(row) -> Dict:
         "ui_price": int(row[7]) if row[7] is not None else None,
         "rrc": float(row[8]) if row[8] is not None else None,
         "updated_at": row[9].isoformat() if row[9] else None,
+        "sales_24h": int(row[10]) if row[10] is not None else None,
     }
 
 def list_products(table: Optional[str] = None) -> List[Dict]:
@@ -58,7 +59,7 @@ def list_products(table: Optional[str] = None) -> List[Dict]:
         SELECT
             nm_id, brand, title, seller_id, seller_name,
             price_before_discount, price_after_seller_discount,
-            ui_price, rrc, updated_at
+            ui_price, rrc, updated_at, sales_24h
         FROM {t}
         ORDER BY nm_id
     """
@@ -83,13 +84,14 @@ def upsert_product(
     seller_name: Optional[str] = None,
     ui_price: Optional[int] = None,
     table: Optional[str] = None,
+    sales_24h: Optional[int] = None,
 ) -> None:
     t = _effective_table(table)
     sql = f"""
         INSERT INTO {t}
             (nm_id, brand, title, seller_id, seller_name,
-             price_before_discount, price_after_seller_discount, ui_price, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+             price_before_discount, price_after_seller_discount, ui_price, updated_at, sales_24h)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
         ON DUPLICATE KEY UPDATE
             brand = VALUES(brand),
             title = VALUES(title),
@@ -98,13 +100,14 @@ def upsert_product(
             price_before_discount = VALUES(price_before_discount),
             price_after_seller_discount = VALUES(price_after_seller_discount),
             ui_price = VALUES(ui_price),
-            updated_at = NOW()
+            updated_at = NOW(),
+            sales_24h = COALESCE(VALUES(sales_24h), sales_24h)
     """
     try:
         conn = get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, (nm_id, brand, title, seller_id, seller_name, price_before, price_after, ui_price))
+                cur.execute(sql, (nm_id, brand, title, seller_id, seller_name, price_before, price_after, ui_price, sales_24h))
             conn.commit()
         finally:
             conn.close()
@@ -440,6 +443,7 @@ def _sanitize_order(order_by: str, order_dir: str) -> Tuple[str, str]:
         "price_after_seller_discount": "price_after_seller_discount",
         "updated_at": "updated_at",
         "rrc": "rrc",
+        "sales_24h": "sales_24h",
     }
     col = allowed.get(order_by, "nm_id")
     dir_ = "DESC" if (order_dir or "").lower() == "desc" else "ASC"
@@ -452,7 +456,7 @@ def list_products_page(limit: int, offset: int, order_by: str = "nm_id", order_d
         SELECT
             nm_id, brand, title, seller_id, seller_name,
             price_before_discount, price_after_seller_discount,
-            ui_price, rrc, updated_at
+            ui_price, rrc, updated_at, sales_24h
         FROM {t}
         ORDER BY {col} {dir_}, nm_id ASC
         LIMIT %s OFFSET %s
@@ -475,7 +479,7 @@ def list_products_page_violations(limit: int, offset: int, order_by: str = "nm_i
         SELECT
             nm_id, brand, title, seller_id, seller_name,
             price_before_discount, price_after_seller_discount,
-            ui_price, rrc, updated_at
+            ui_price, rrc, updated_at, sales_24h
         FROM {t}
         WHERE rrc IS NOT NULL AND rrc > 0
           AND ((ui_price IS NOT NULL AND ui_price > 0 AND ui_price < rrc)

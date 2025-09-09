@@ -158,6 +158,7 @@ def list_products():
             "price_after_seller_discount": "price_after_seller_discount",
             "updated_at": "updated_at",
             "rrc": "rrc",
+            "sales_24h": "sales_24h",
         }
         sort_col = sort_map.get(sort, "nm_id")
 
@@ -167,15 +168,6 @@ def list_products():
         else:
             total_rows = count_all_rows(table=table)
             items = list_products_page(limit=limit, offset=offset, order_by=sort_col, order_dir=dir_, table=table)
-        
-        nm_ids = [int(it["nm_id"]) for it in items]  # текущая страница
-        try:
-            sold_map = sales_24h_for_nm_list(nm_ids)
-        except Exception:
-            sold_map = {}
-
-        for it in items:
-            it["sold_24h"] = int(sold_map.get(int(it["nm_id"]), 0))
 
         page = (offset // limit) + 1
         total_pages = (total_rows + limit - 1) // limit
@@ -205,6 +197,7 @@ def add_product():
         return jsonify({"ok": False, "error": "nm_id должен быть числом"}), 400
     try:
         data = fetch_wb_price(nm_id)
+        sales= sales_24h_for_nm_list([nm_id])
         unavail = _infer_unavailable(data)
         rrc_auto = calc_rrc_from_title(data.get("title"))
 
@@ -219,6 +212,7 @@ def add_product():
                 seller_name=data.get("seller_name") or None,
                 ui_price=None,
                 table=table,
+                sales_24h=sales.get(nm_id, 0)
             )
         else:
             ui_price = calc_ui_price_from_product(float(data.get("price_after_seller_discount") or 0))
@@ -232,6 +226,7 @@ def add_product():
                 seller_name=data.get("seller_name") or None,
                 ui_price=int(ui_price) if ui_price is not None else None,
                 table=table,
+                sales_24h=sales.get(nm_id, 0)
             )
 
         if rrc_auto is not None:
@@ -246,6 +241,7 @@ def refresh_product(nm_id: int):
     table = resolve_table()
     try:
         data = fetch_wb_price(nm_id)
+        sales = sales_24h_for_nm_list([nm_id])
         unavail = _infer_unavailable(data)
         rrc_auto = calc_rrc_from_title(data.get("title"))
 
@@ -260,6 +256,7 @@ def refresh_product(nm_id: int):
                 seller_name=data.get("seller_name") or None,
                 ui_price=None,
                 table=table,
+                sales_24h=sales.get(nm_id, 0)
             )
         else:
             ui_price = calc_ui_price_from_product(float(data.get("price_after_seller_discount") or 0))
@@ -273,6 +270,7 @@ def refresh_product(nm_id: int):
                 seller_name=data.get("seller_name") or None,
                 ui_price=int(ui_price) if ui_price is not None else None,
                 table=table,
+                sales_24h=sales.get(nm_id, 0)
             )
 
         if rrc_auto is not None:
@@ -352,6 +350,7 @@ def refresh_batch():
             for nm_id in nm_ids:
                 try:
                     data = fetch_wb_price(nm_id)
+                    sales = sales_24h_for_nm_list([nm_id])
                     price_before = float(data.get("price_before_discount") or 0)
                     price_after  = float(data.get("price_after_seller_discount") or 0)
                     if price_before <= 0 and price_after <= 0:
@@ -370,6 +369,7 @@ def refresh_batch():
                         seller_name=data.get("seller_name") or None,
                         ui_price=int(ui_price) if ui_price is not None else None,
                         table=table,
+                        sales_24h=sales.get(nm_id, 0)
                     )
                     if rrc_auto is not None:
                         set_rrc(nm_id, rrc_auto, table=table)
