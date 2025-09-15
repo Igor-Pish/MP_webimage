@@ -14,7 +14,7 @@ from apscheduler.events import (
 )
 from pytz import timezone
 
-from telegram_client import send_daily_summary
+from telegram_client import send_daily_summary, send_top_sellers_summary
 from db import (
     list_admin_chat_ids, upsert_admin, delete_admin,
     get_seller_name, list_sellers_with_violations
@@ -61,6 +61,13 @@ async def daily_summary_job():
     except Exception as e:
         logging.exception("[scheduler] daily_summary_job error: %s", e)
 
+async def daily_sales_summary_job():
+    try:
+        send_top_sellers_summary()
+        logging.info("[scheduler] top sellers summary sent")
+    except Exception as e:
+        logging.exception("[scheduler] daily_sales_summary_job error: %s", e)
+
 def _job_listener(event):
     if event.code == EVENT_JOB_EXECUTED:
         logging.info("[APS] job executed: %s", event.job_id)
@@ -78,6 +85,16 @@ async def daily_silent_refresh():
                 print("[daily_silent_refresh]", r.status, txt[:200])
     except Exception as e:
         print("[daily_silent_refresh] error:", e)
+
+async def daily_silent_test_refresh():
+    url = "https://test.web-image.su/api/products/refresh-batch?full=1&silent=1"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, timeout=600) as r:
+                txt = await r.text()
+                print("[daily_silent_test_refresh]", r.status, txt[:200])
+    except Exception as e:
+        print("[daily_silent_test_refresh] error:", e)
 
 # ===== Handlers =====
 @dp.message_handler(CommandStart())
@@ -283,12 +300,30 @@ async def on_startup(dp_: Dispatcher):
         id="daily_summary",
         replace_existing=True,
     )
+    # Ежедневная сводка топ-продавцов
+    scheduler.add_job(
+        daily_sales_summary_job,
+        trigger="cron",
+        day_of_week=SUM_DOW,
+        hour=SUM_HOUR,
+        minute=SUM_MIN,
+        id="daily_sales_summary",
+        replace_existing=True,
+    )
     # Ежедневное обновление всех товаров в «тихом» режиме (без пушей)
     scheduler.add_job(
         daily_silent_refresh,
         trigger="interval",
         hours=6,
         id="silent_refresh",
+        replace_existing=True,
+    )
+    # Ежедневное обновление тестового стенда в «тихом» режиме (без пушей)
+    scheduler.add_job(
+        daily_silent_test_refresh,
+        trigger="interval",
+        hours=6,
+        id="silent_test_refresh",
         replace_existing=True,
     )
 

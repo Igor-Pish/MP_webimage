@@ -268,6 +268,65 @@ def sales_last_24h() -> dict[int, int]:
             sales[seller_id] = sales.get(seller_id, 0) + sold
     return sales
 
+# ====== Все еллеры с продажами за 24 часа ======
+def list_sellers_by_sales_24h(
+    min_sales: int = 1,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    table: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Возвращает список селлеров с продажами за 24ч >= min_sales,
+    агрегируя по всем их товарам, в порядке убывания суммы продаж.
+
+    Параметры:
+      - min_sales: порог по сумме sales_24h (по умолчанию >=1)
+      - limit/offset: постранично (необязательно)
+      - table: имя таблицы (products / products_ozon). Если не задано — TABLE.
+
+    Формат ответа:
+      [ { "seller_id": int, "seller_name": str|None, "sales_24h": int }, ... ]
+      где sales_24h — сумма по всем товарам селлера.
+    """
+    tbl = table or TABLE
+
+    base_sql = f"""
+        SELECT
+            seller_id,
+            MAX(seller_name) AS seller_name,
+            SUM(COALESCE(sales_24h, 0)) AS sum_sales
+        FROM {tbl}
+        WHERE seller_id IS NOT NULL
+          AND sales_24h IS NOT NULL
+          AND sales_24h > 0
+        GROUP BY seller_id
+        HAVING SUM(COALESCE(sales_24h, 0)) >= %s
+        ORDER BY sum_sales DESC, seller_id ASC
+    """
+
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                if limit is not None and limit > 0:
+                    sql = base_sql + " LIMIT %s OFFSET %s"
+                    cur.execute(sql, (int(min_sales), int(limit), int(offset)))
+                else:
+                    cur.execute(base_sql, (int(min_sales),))
+                rows = cur.fetchall()
+                return [
+                    {
+                        "seller_id": int(r[0]),
+                        "seller_name": r[1],
+                        "sales_24h": int(r[2] or 0),
+                    }
+                    for r in rows
+                ]
+        finally:
+            conn.close()
+    except MySQLError as e:
+        raise RuntimeError(f"MySQL list_sellers_by_sales_24h error: {e}")
+
 # ====== Поддержка батч-обновления ======
 def _where_need_refresh() -> str:
     where = "(price_after_seller_discount IS NULL OR price_after_seller_discount = 0)"
